@@ -399,6 +399,12 @@ impl WavefrontAligner {
             self.cigar.resize(max_ops);
         }
 
+        // Enable modular wavefront storage for score-only mode (like C reference).
+        // This keeps only max_score_scope wavefronts alive, dramatically reducing
+        // memory usage and improving cache performance.
+        let score_only = self.alignment_scope == AlignmentScope::ComputeScore;
+        self.wf_components.memory_modular = score_only;
+
         // Resize components for sequence dimensions
         self.wf_components.resize(plen, tlen, &self.penalties);
 
@@ -677,6 +683,11 @@ impl WavefrontAligner {
             wf_prev.init_ends_lower(lo - 1);
         }
 
+        // Free old wavefronts at modular slot
+        if self.wf_components.memory_modular {
+            self.free_output_wavefronts_m(score_curr);
+        }
+
         // Allocate output wavefront using historic bounds
         let hist_lo = self.wf_components.historic_min_lo;
         let hist_hi = self.wf_components.historic_max_hi;
@@ -776,6 +787,11 @@ impl WavefrontAligner {
         }
         let use_misms_idx = misms_idx;
 
+        // Free old wavefronts at modular slot
+        if self.wf_components.memory_modular {
+            self.free_output_wavefronts_m(score_curr);
+        }
+
         // Allocate output wavefront using historic bounds
         let hist_lo = self.wf_components.historic_min_lo;
         let hist_hi = self.wf_components.historic_max_hi;
@@ -786,9 +802,6 @@ impl WavefrontAligner {
         }
 
         // Compute kernel using raw pointers for multi-borrow
-        // SAFETY: curr_idx is freshly allocated and distinct from all input indices.
-        // Input wavefronts are either the null wavefront (not in slab) or at
-        // prior score indices which are guaranteed different from curr_idx.
         unsafe {
             let null_wf = &self.wf_components.wavefront_null as *const _;
 
@@ -888,48 +901,54 @@ impl WavefrontAligner {
         }
 
         if lo > hi {
-            // No valid inputs
+            // No valid inputs — free old modular slot and set to none
+            if self.wf_components.memory_modular {
+                self.free_output_wavefronts_affine(score_curr);
+            }
             return;
         }
 
         // Clamp lo/hi to leave room for kernel's k±1 reads within allocated range.
-        // All slab wavefronts have base_k = hist_lo, so k-1 ≥ hist_lo and k+1 ≤ hist_hi.
         let hist_lo = self.wf_components.historic_min_lo;
         let hist_hi = self.wf_components.historic_max_hi;
         lo = lo.max(hist_lo + 1);
         hi = hi.min(hist_hi - 1);
 
         if lo > hi {
+            if self.wf_components.memory_modular {
+                self.free_output_wavefronts_affine(score_curr);
+            }
             return;
         }
 
         // Ensure null/victim wavefronts cover the range
         self.wf_components.resize_null_victim(lo, hi);
 
-        // Initialize input wavefront ends (like C's wavefront_compute_init_ends)
-        // m_misms: kernel reads at k → needs [lo, hi]
+        // Initialize input wavefront ends
         if m_misms_idx != WAVEFRONT_IDX_NONE {
             let wf = self.wavefront_slab.get_mut(m_misms_idx);
             wf.init_ends_higher(hi);
             wf.init_ends_lower(lo);
         }
-        // m_open: kernel reads at k-1 and k+1 → needs [lo-1, hi+1]
         if m_open_idx != WAVEFRONT_IDX_NONE {
             let wf = self.wavefront_slab.get_mut(m_open_idx);
             wf.init_ends_higher(hi + 1);
             wf.init_ends_lower(lo - 1);
         }
-        // i1_ext: kernel reads at k-1 → needs [lo-1, hi-1]
         if i1_ext_idx != WAVEFRONT_IDX_NONE {
             let wf = self.wavefront_slab.get_mut(i1_ext_idx);
             wf.init_ends_higher(hi);
             wf.init_ends_lower(lo - 1);
         }
-        // d1_ext: kernel reads at k+1 → needs [lo+1, hi+1]
         if d1_ext_idx != WAVEFRONT_IDX_NONE {
             let wf = self.wavefront_slab.get_mut(d1_ext_idx);
             wf.init_ends_higher(hi + 1);
             wf.init_ends_lower(lo);
+        }
+
+        // Free old wavefronts at modular slot
+        if self.wf_components.memory_modular {
+            self.free_output_wavefronts_affine(score_curr);
         }
 
         // Allocate 3 output wavefronts using historic bounds
@@ -1001,7 +1020,16 @@ impl WavefrontAligner {
         self.wf_components.set_i1_idx(score_curr, i1_curr_idx);
         self.wf_components.set_d1_idx(score_curr, d1_curr_idx);
 
-        // Trim ends (on M-wavefront)
+        // Trim ends on ALL output wavefronts (matching C's wavefront_compute_process_ends).
+        // This prevents un-trimmed I1/D1 ranges from inflating subsequent steps' [lo,hi].
+        {
+            let wf = self.wavefront_slab.get_mut(i1_curr_idx);
+            compute::trim_ends(plen, tlen, wf);
+        }
+        {
+            let wf = self.wavefront_slab.get_mut(d1_curr_idx);
+            compute::trim_ends(plen, tlen, wf);
+        }
         {
             let wf_curr = self.wavefront_slab.get_mut(m_curr_idx);
             compute::trim_ends(plen, tlen, wf_curr);
@@ -1141,6 +1169,11 @@ impl WavefrontAligner {
             wf.init_ends_lower(lo);
         }
 
+        // Free old wavefronts at modular slot
+        if self.wf_components.memory_modular {
+            self.free_output_wavefronts_affine2p(score_curr);
+        }
+
         // Allocate 5 output wavefronts using historic bounds
         let m_curr_idx = self.wavefront_slab.allocate(hist_lo, hist_hi);
         let i1_curr_idx = self.wavefront_slab.allocate(hist_lo, hist_hi);
@@ -1242,7 +1275,23 @@ impl WavefrontAligner {
         self.wf_components.set_d1_idx(score_curr, d1_curr_idx);
         self.wf_components.set_d2_idx(score_curr, d2_curr_idx);
 
-        // Trim ends (on M-wavefront)
+        // Trim ends on ALL output wavefronts
+        {
+            let wf = self.wavefront_slab.get_mut(i1_curr_idx);
+            compute::trim_ends(plen, tlen, wf);
+        }
+        {
+            let wf = self.wavefront_slab.get_mut(i2_curr_idx);
+            compute::trim_ends(plen, tlen, wf);
+        }
+        {
+            let wf = self.wavefront_slab.get_mut(d1_curr_idx);
+            compute::trim_ends(plen, tlen, wf);
+        }
+        {
+            let wf = self.wavefront_slab.get_mut(d2_curr_idx);
+            compute::trim_ends(plen, tlen, wf);
+        }
         {
             let wf_curr = self.wavefront_slab.get_mut(m_curr_idx);
             compute::trim_ends(plen, tlen, wf_curr);
@@ -1421,6 +1470,8 @@ impl WavefrontAligner {
             rev,
             p_sub,
             t_sub,
+            component_begin,
+            component_end,
             &mut breakpoint,
         );
 
@@ -1496,16 +1547,19 @@ impl WavefrontAligner {
         rev: &mut WavefrontAligner,
         pattern: &[u8],
         text: &[u8],
+        component_begin: ComponentType,
+        component_end: ComponentType,
         breakpoint: &mut BiAlignBreakpoint,
     ) -> bool {
         let plen = pattern.len() as i32;
         let tlen = text.len() as i32;
 
-        // Init sub-aligners
+        // Init sub-aligners with correct starting components
+        // Forward starts from component_begin, reverse starts from component_end
         fwd.sequences.init_ascii(pattern, text, false);
-        fwd.init_alignment();
+        fwd.init_alignment_component(component_begin);
         rev.sequences.init_ascii(pattern, text, true);
-        rev.init_alignment();
+        rev.init_alignment_component(component_end);
 
         let has_affine = matches!(
             penalties.distance_metric,
@@ -1555,25 +1609,53 @@ impl WavefrontAligner {
             }
         }
 
-        // First overlap check (on whichever side was last extended)
-        if last_was_forward {
-            bialign::bialign_overlap(
-                &fwd.wf_components,
-                &fwd.wavefront_slab,
-                &rev.wf_components,
-                &rev.wavefront_slab,
-                score_fwd,
-                score_rev,
-                plen,
-                tlen,
-                penalties.gap_opening1,
-                penalties.gap_opening2,
-                has_affine,
-                has_affine2p,
-                true,
-                breakpoint,
-            );
-        } else {
+        // Phase 2: Alternate compute+extend with overlap checks
+        // Match C reference: overlap check first, then compute opposite direction
+        let max_score_scope = fwd.wf_components.max_score_scope as i32;
+
+        loop {
+            if last_was_forward {
+                // Check forward overlap
+                let min_score_rev = if score_rev > max_score_scope - 1 {
+                    score_rev - (max_score_scope - 1)
+                } else {
+                    0
+                };
+                if score_fwd + min_score_rev - gap_opening >= breakpoint.score {
+                    break;
+                }
+                bialign::bialign_overlap(
+                    &fwd.wf_components,
+                    &fwd.wavefront_slab,
+                    &rev.wf_components,
+                    &rev.wavefront_slab,
+                    score_fwd,
+                    score_rev,
+                    plen,
+                    tlen,
+                    penalties.gap_opening1,
+                    penalties.gap_opening2,
+                    has_affine,
+                    has_affine2p,
+                    true,
+                    breakpoint,
+                );
+
+                // Compute+extend reverse
+                score_rev += 1;
+                rev.compute_step(score_rev);
+                rev.extend_biwfa(score_rev);
+            }
+
+            // Check reverse overlap
+            let min_score_fwd = if score_fwd > max_score_scope - 1 {
+                score_fwd - (max_score_scope - 1)
+            } else {
+                0
+            };
+            if min_score_fwd + score_rev - gap_opening >= breakpoint.score {
+                break;
+            }
             bialign::bialign_overlap(
                 &rev.wf_components,
                 &rev.wavefront_slab,
@@ -1590,58 +1672,17 @@ impl WavefrontAligner {
                 false,
                 breakpoint,
             );
-        }
 
-        // Phase 2: Continue alternating with overlap checks
-        while score_fwd + score_rev - gap_opening < breakpoint.score {
-            // Forward
+            // Compute+extend forward
             score_fwd += 1;
             fwd.compute_step(score_fwd);
             fwd.extend_biwfa(score_fwd);
-            bialign::bialign_overlap(
-                &fwd.wf_components,
-                &fwd.wavefront_slab,
-                &rev.wf_components,
-                &rev.wavefront_slab,
-                score_fwd,
-                score_rev,
-                plen,
-                tlen,
-                penalties.gap_opening1,
-                penalties.gap_opening2,
-                has_affine,
-                has_affine2p,
-                true,
-                breakpoint,
-            );
-            if score_fwd + score_rev - gap_opening >= breakpoint.score {
-                break;
-            }
-
-            // Reverse
-            score_rev += 1;
-            rev.compute_step(score_rev);
-            rev.extend_biwfa(score_rev);
-            bialign::bialign_overlap(
-                &rev.wf_components,
-                &rev.wavefront_slab,
-                &fwd.wf_components,
-                &fwd.wavefront_slab,
-                score_rev,
-                score_fwd,
-                plen,
-                tlen,
-                penalties.gap_opening1,
-                penalties.gap_opening2,
-                has_affine,
-                has_affine2p,
-                false,
-                breakpoint,
-            );
 
             if score_fwd + score_rev >= max_steps {
                 return false;
             }
+
+            last_was_forward = true;
         }
 
         breakpoint.found()
@@ -1839,6 +1880,66 @@ impl WavefrontAligner {
         } else {
             false
         }
+    }
+
+    /// Free old wavefronts at the modular slot for edit/indel/linear (M only).
+    fn free_output_wavefronts_m(&mut self, score: usize) {
+        let score_mod = score % self.wf_components.max_score_scope;
+        let old_m = self.wf_components.get_m_idx(score_mod);
+        if old_m != WAVEFRONT_IDX_NONE {
+            self.wavefront_slab.free(old_m);
+        }
+        self.wf_components.set_m_idx(score, WAVEFRONT_IDX_NONE);
+    }
+
+    /// Free old wavefronts at the modular slot for affine (M, I1, D1).
+    fn free_output_wavefronts_affine(&mut self, score: usize) {
+        let score_mod = score % self.wf_components.max_score_scope;
+        let old_m = self.wf_components.get_m_idx(score_mod);
+        if old_m != WAVEFRONT_IDX_NONE {
+            self.wavefront_slab.free(old_m);
+        }
+        let old_i1 = self.wf_components.get_i1_idx(score_mod);
+        if old_i1 != WAVEFRONT_IDX_NONE {
+            self.wavefront_slab.free(old_i1);
+        }
+        let old_d1 = self.wf_components.get_d1_idx(score_mod);
+        if old_d1 != WAVEFRONT_IDX_NONE {
+            self.wavefront_slab.free(old_d1);
+        }
+        self.wf_components.set_m_idx(score, WAVEFRONT_IDX_NONE);
+        self.wf_components.set_i1_idx(score, WAVEFRONT_IDX_NONE);
+        self.wf_components.set_d1_idx(score, WAVEFRONT_IDX_NONE);
+    }
+
+    /// Free old wavefronts at the modular slot for affine2p (M, I1, D1, I2, D2).
+    fn free_output_wavefronts_affine2p(&mut self, score: usize) {
+        let score_mod = score % self.wf_components.max_score_scope;
+        let old_m = self.wf_components.get_m_idx(score_mod);
+        if old_m != WAVEFRONT_IDX_NONE {
+            self.wavefront_slab.free(old_m);
+        }
+        let old_i1 = self.wf_components.get_i1_idx(score_mod);
+        if old_i1 != WAVEFRONT_IDX_NONE {
+            self.wavefront_slab.free(old_i1);
+        }
+        let old_d1 = self.wf_components.get_d1_idx(score_mod);
+        if old_d1 != WAVEFRONT_IDX_NONE {
+            self.wavefront_slab.free(old_d1);
+        }
+        let old_i2 = self.wf_components.get_i2_idx(score_mod);
+        if old_i2 != WAVEFRONT_IDX_NONE {
+            self.wavefront_slab.free(old_i2);
+        }
+        let old_d2 = self.wf_components.get_d2_idx(score_mod);
+        if old_d2 != WAVEFRONT_IDX_NONE {
+            self.wavefront_slab.free(old_d2);
+        }
+        self.wf_components.set_m_idx(score, WAVEFRONT_IDX_NONE);
+        self.wf_components.set_i1_idx(score, WAVEFRONT_IDX_NONE);
+        self.wf_components.set_d1_idx(score, WAVEFRONT_IDX_NONE);
+        self.wf_components.set_i2_idx(score, WAVEFRONT_IDX_NONE);
+        self.wf_components.set_d2_idx(score, WAVEFRONT_IDX_NONE);
     }
 
     /// Dispatch compute step based on distance metric.

@@ -267,12 +267,16 @@ fn main() {
     let mut correct_count = 0u32;
     let total = pairs.len() as u32;
 
+    let mut align_nanos: u64 = 0;
+
     for (pattern, text) in &pairs {
+        let t0 = std::time::Instant::now();
         let wfa_score = if use_biwfa && !score_only {
             aligner.align_biwfa(pattern, text)
         } else {
             aligner.align_end2end(pattern, text)
         };
+        align_nanos += t0.elapsed().as_nanos() as u64;
 
         let output_score = compute_output_score(
             &aligner,
@@ -302,6 +306,14 @@ fn main() {
             }
         }
     }
+
+    let align_ms = align_nanos as f64 / 1_000_000.0;
+    eprintln!(
+        "Time.Alignment {:.2} ms ({} calls, {:.2} us/call)",
+        align_ms,
+        total,
+        align_ms * 1000.0 / total as f64
+    );
 
     // Write output
     if let Some(ref output_path) = cli.output {

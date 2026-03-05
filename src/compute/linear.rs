@@ -17,7 +17,7 @@ use crate::wavefront::Wavefront;
 /// - `wf_gap`: M-wavefront at score - indel
 ///
 /// Writes to `wf_curr` for diagonals [lo, hi].
-#[inline(never)]
+#[inline]
 pub fn compute_linear_idm(
     pattern_length: i32,
     text_length: i32,
@@ -27,34 +27,63 @@ pub fn compute_linear_idm(
     lo: i32,
     hi: i32,
 ) {
-    let misms_offsets = wf_misms.offsets_slice();
-    let misms_base = wf_misms.base_k();
-    let gap_offsets = wf_gap.offsets_slice();
-    let gap_base = wf_gap.base_k();
-    let curr_base = wf_curr.base_k();
-    let curr_offsets = wf_curr.offsets_slice_mut();
+    // SAFETY: Bounds guaranteed by caller (lo/hi clamped, init_ends called).
+    unsafe {
+        let misms_ptr = wf_misms.offsets_slice().as_ptr().wrapping_offset(-(wf_misms.base_k() as isize));
+        let gap_ptr = wf_gap.offsets_slice().as_ptr().wrapping_offset(-(wf_gap.base_k() as isize));
+        let curr_ptr = wf_curr.offsets_slice_mut().as_mut_ptr().wrapping_offset(-(wf_curr.base_k() as isize));
 
-    for k in lo..=hi {
-        // Mismatch: M[s-x, k] + 1
-        let misms = misms_offsets[(k - misms_base) as usize] + 1;
-        // Insertion: M[s-o, k-1] + 1
-        let ins = gap_offsets[((k - 1) - gap_base) as usize] + 1;
-        // Deletion: M[s-o, k+1]
-        let del = gap_offsets[((k + 1) - gap_base) as usize];
+        let count = hi - lo + 1;
+        let mut k = lo;
 
-        let mut max: WfOffset = del.max(ins.max(misms));
+        #[cfg(target_arch = "aarch64")]
+        {
+            use std::arch::aarch64::*;
+            if count >= 4 {
+                unsafe {
+                    let v_one = vdupq_n_s32(1);
+                    let v_four = vdupq_n_s32(4);
+                    let v_null = vdupq_n_s32(OFFSET_NULL);
+                    let v_tlen = vdupq_n_u32(text_length as u32);
+                    let v_plen = vdupq_n_u32(pattern_length as u32);
+                    let k_base: [i32; 4] = [0, 1, 2, 3];
+                    let mut v_k = vaddq_s32(vdupq_n_s32(lo), vld1q_s32(k_base.as_ptr()));
+                    let neon_end = lo + (count & !3);
 
-        // Bounds check using unsigned cast
-        let h = wavefront_h(k, max) as u32;
-        let v = wavefront_v(k, max) as u32;
-        if h > text_length as u32 {
-            max = OFFSET_NULL;
+                    while k < neon_end {
+                        let v_misms = vaddq_s32(vld1q_s32(misms_ptr.offset(k as isize)), v_one);
+                        let v_ins = vaddq_s32(vld1q_s32(gap_ptr.offset(k as isize - 1)), v_one);
+                        let v_del = vld1q_s32(gap_ptr.offset(k as isize + 1));
+                        let v_max = vmaxq_s32(v_del, vmaxq_s32(v_ins, v_misms));
+
+                        let v_h = vreinterpretq_u32_s32(v_max);
+                        let v_v = vreinterpretq_u32_s32(vsubq_s32(v_max, v_k));
+                        let oob = vorrq_u32(vcgtq_u32(v_h, v_tlen), vcgtq_u32(v_v, v_plen));
+                        let v_result = vbslq_s32(oob, v_null, v_max);
+
+                        vst1q_s32(curr_ptr.offset(k as isize), v_result);
+                        k += 4;
+                        v_k = vaddq_s32(v_k, v_four);
+                    }
+                }
+            }
         }
-        if v > pattern_length as u32 {
-            max = OFFSET_NULL;
-        }
 
-        curr_offsets[(k - curr_base) as usize] = max;
+        while k <= hi {
+            let misms = *misms_ptr.offset(k as isize) + 1;
+            let ins = *gap_ptr.offset(k as isize - 1) + 1;
+            let del = *gap_ptr.offset(k as isize + 1);
+            let mut max: WfOffset = del.max(ins.max(misms));
+
+            let h = wavefront_h(k, max) as u32;
+            let v = wavefront_v(k, max) as u32;
+            if h > text_length as u32 || v > pattern_length as u32 {
+                max = OFFSET_NULL;
+            }
+
+            *curr_ptr.offset(k as isize) = max;
+            k += 1;
+        }
     }
 }
 

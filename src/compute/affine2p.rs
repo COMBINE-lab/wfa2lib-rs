@@ -27,7 +27,7 @@ use crate::wavefront::Wavefront;
 ///
 /// Output wavefronts (write):
 /// - `wf_m_curr`, `wf_i1_curr`, `wf_i2_curr`, `wf_d1_curr`, `wf_d2_curr`
-#[inline(never)]
+#[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn compute_affine2p_idm(
     pattern_length: i32,
@@ -47,71 +47,111 @@ pub fn compute_affine2p_idm(
     lo: i32,
     hi: i32,
 ) {
-    let m_misms_offsets = wf_m_misms.offsets_slice();
-    let m_misms_base = wf_m_misms.base_k();
-    let m_open1_offsets = wf_m_open1.offsets_slice();
-    let m_open1_base = wf_m_open1.base_k();
-    let m_open2_offsets = wf_m_open2.offsets_slice();
-    let m_open2_base = wf_m_open2.base_k();
-    let i1_ext_offsets = wf_i1_ext.offsets_slice();
-    let i1_ext_base = wf_i1_ext.base_k();
-    let i2_ext_offsets = wf_i2_ext.offsets_slice();
-    let i2_ext_base = wf_i2_ext.base_k();
-    let d1_ext_offsets = wf_d1_ext.offsets_slice();
-    let d1_ext_base = wf_d1_ext.base_k();
-    let d2_ext_offsets = wf_d2_ext.offsets_slice();
-    let d2_ext_base = wf_d2_ext.base_k();
+    // SAFETY: Bounds guaranteed by caller (lo/hi clamped, init_ends called).
+    unsafe {
+        let m_misms = wf_m_misms.offsets_slice().as_ptr().wrapping_offset(-(wf_m_misms.base_k() as isize));
+        let m_open1 = wf_m_open1.offsets_slice().as_ptr().wrapping_offset(-(wf_m_open1.base_k() as isize));
+        let m_open2 = wf_m_open2.offsets_slice().as_ptr().wrapping_offset(-(wf_m_open2.base_k() as isize));
+        let i1_ext = wf_i1_ext.offsets_slice().as_ptr().wrapping_offset(-(wf_i1_ext.base_k() as isize));
+        let i2_ext = wf_i2_ext.offsets_slice().as_ptr().wrapping_offset(-(wf_i2_ext.base_k() as isize));
+        let d1_ext = wf_d1_ext.offsets_slice().as_ptr().wrapping_offset(-(wf_d1_ext.base_k() as isize));
+        let d2_ext = wf_d2_ext.offsets_slice().as_ptr().wrapping_offset(-(wf_d2_ext.base_k() as isize));
+        let m_curr = wf_m_curr.offsets_slice_mut().as_mut_ptr().wrapping_offset(-(wf_m_curr.base_k() as isize));
+        let i1_curr = wf_i1_curr.offsets_slice_mut().as_mut_ptr().wrapping_offset(-(wf_i1_curr.base_k() as isize));
+        let i2_curr = wf_i2_curr.offsets_slice_mut().as_mut_ptr().wrapping_offset(-(wf_i2_curr.base_k() as isize));
+        let d1_curr = wf_d1_curr.offsets_slice_mut().as_mut_ptr().wrapping_offset(-(wf_d1_curr.base_k() as isize));
+        let d2_curr = wf_d2_curr.offsets_slice_mut().as_mut_ptr().wrapping_offset(-(wf_d2_curr.base_k() as isize));
 
-    let m_curr_base = wf_m_curr.base_k();
-    let m_curr_offsets = wf_m_curr.offsets_slice_mut();
-    let i1_curr_base = wf_i1_curr.base_k();
-    let i1_curr_offsets = wf_i1_curr.offsets_slice_mut();
-    let i2_curr_base = wf_i2_curr.base_k();
-    let i2_curr_offsets = wf_i2_curr.offsets_slice_mut();
-    let d1_curr_base = wf_d1_curr.base_k();
-    let d1_curr_offsets = wf_d1_curr.offsets_slice_mut();
-    let d2_curr_base = wf_d2_curr.base_k();
-    let d2_curr_offsets = wf_d2_curr.offsets_slice_mut();
+        let count = hi - lo + 1;
+        let mut k = lo;
 
-    for k in lo..=hi {
-        // I1[s,k] = max(M[s-(O1+E1), k-1], I1[s-E1, k-1]) + 1
-        let i1_m_open = m_open1_offsets[((k - 1) - m_open1_base) as usize];
-        let i1_ext = i1_ext_offsets[((k - 1) - i1_ext_base) as usize];
-        let i1: WfOffset = i1_m_open.max(i1_ext) + 1;
+        #[cfg(target_arch = "aarch64")]
+        {
+            use std::arch::aarch64::*;
+            if count >= 4 {
+                unsafe {
+                    let v_one = vdupq_n_s32(1);
+                    let v_four = vdupq_n_s32(4);
+                    let v_null = vdupq_n_s32(OFFSET_NULL);
+                    let v_tlen = vdupq_n_u32(text_length as u32);
+                    let v_plen = vdupq_n_u32(pattern_length as u32);
+                    let k_base: [i32; 4] = [0, 1, 2, 3];
+                    let mut v_k = vaddq_s32(vdupq_n_s32(lo), vld1q_s32(k_base.as_ptr()));
+                    let neon_end = lo + (count & !3);
 
-        // I2[s,k] = max(M[s-(O2+E2), k-1], I2[s-E2, k-1]) + 1
-        let i2_m_open = m_open2_offsets[((k - 1) - m_open2_base) as usize];
-        let i2_ext = i2_ext_offsets[((k - 1) - i2_ext_base) as usize];
-        let i2: WfOffset = i2_m_open.max(i2_ext) + 1;
+                    while k < neon_end {
+                        // I1, I2 (shifted by -1)
+                        let v_i1 = vaddq_s32(vmaxq_s32(
+                            vld1q_s32(m_open1.offset(k as isize - 1)),
+                            vld1q_s32(i1_ext.offset(k as isize - 1)),
+                        ), v_one);
+                        let v_i2 = vaddq_s32(vmaxq_s32(
+                            vld1q_s32(m_open2.offset(k as isize - 1)),
+                            vld1q_s32(i2_ext.offset(k as isize - 1)),
+                        ), v_one);
+                        // D1, D2 (shifted by +1)
+                        let v_d1 = vmaxq_s32(
+                            vld1q_s32(m_open1.offset(k as isize + 1)),
+                            vld1q_s32(d1_ext.offset(k as isize + 1)),
+                        );
+                        let v_d2 = vmaxq_s32(
+                            vld1q_s32(m_open2.offset(k as isize + 1)),
+                            vld1q_s32(d2_ext.offset(k as isize + 1)),
+                        );
+                        // M = max(misms+1, max(i1,i2), max(d1,d2))
+                        let v_misms = vaddq_s32(vld1q_s32(m_misms.offset(k as isize)), v_one);
+                        let v_ins = vmaxq_s32(v_i1, v_i2);
+                        let v_del = vmaxq_s32(v_d1, v_d2);
+                        let v_m = vmaxq_s32(v_misms, vmaxq_s32(v_ins, v_del));
 
-        // D1[s,k] = max(M[s-(O1+E1), k+1], D1[s-E1, k+1])
-        let d1_m_open = m_open1_offsets[((k + 1) - m_open1_base) as usize];
-        let d1_ext = d1_ext_offsets[((k + 1) - d1_ext_base) as usize];
-        let d1: WfOffset = d1_m_open.max(d1_ext);
+                        // Bounds check
+                        let v_h = vreinterpretq_u32_s32(v_m);
+                        let v_v = vreinterpretq_u32_s32(vsubq_s32(v_m, v_k));
+                        let oob = vorrq_u32(vcgtq_u32(v_h, v_tlen), vcgtq_u32(v_v, v_plen));
+                        let v_m_final = vbslq_s32(oob, v_null, v_m);
 
-        // D2[s,k] = max(M[s-(O2+E2), k+1], D2[s-E2, k+1])
-        let d2_m_open = m_open2_offsets[((k + 1) - m_open2_base) as usize];
-        let d2_ext = d2_ext_offsets[((k + 1) - d2_ext_base) as usize];
-        let d2: WfOffset = d2_m_open.max(d2_ext);
+                        // Store all 5 outputs
+                        vst1q_s32(m_curr.offset(k as isize), v_m_final);
+                        vst1q_s32(i1_curr.offset(k as isize), v_i1);
+                        vst1q_s32(i2_curr.offset(k as isize), v_i2);
+                        vst1q_s32(d1_curr.offset(k as isize), v_d1);
+                        vst1q_s32(d2_curr.offset(k as isize), v_d2);
 
-        // M[s,k] = max(M[s-X, k] + 1, I1, I2, D1, D2)
-        let misms = m_misms_offsets[(k - m_misms_base) as usize] + 1;
-        let ins = i1.max(i2);
-        let del = d1.max(d2);
-        let mut m: WfOffset = misms.max(ins.max(del));
-
-        // Bounds check using unsigned cast
-        let h = wavefront_h(k, m) as u32;
-        let v = wavefront_v(k, m) as u32;
-        if h > text_length as u32 || v > pattern_length as u32 {
-            m = OFFSET_NULL;
+                        k += 4;
+                        v_k = vaddq_s32(v_k, v_four);
+                    }
+                }
+            }
         }
 
-        m_curr_offsets[(k - m_curr_base) as usize] = m;
-        i1_curr_offsets[(k - i1_curr_base) as usize] = i1;
-        i2_curr_offsets[(k - i2_curr_base) as usize] = i2;
-        d1_curr_offsets[(k - d1_curr_base) as usize] = d1;
-        d2_curr_offsets[(k - d2_curr_base) as usize] = d2;
+        // Scalar tail
+        while k <= hi {
+            let i1_val: WfOffset = (*m_open1.offset(k as isize - 1))
+                .max(*i1_ext.offset(k as isize - 1)) + 1;
+            let i2_val: WfOffset = (*m_open2.offset(k as isize - 1))
+                .max(*i2_ext.offset(k as isize - 1)) + 1;
+            let d1_val: WfOffset = (*m_open1.offset(k as isize + 1))
+                .max(*d1_ext.offset(k as isize + 1));
+            let d2_val: WfOffset = (*m_open2.offset(k as isize + 1))
+                .max(*d2_ext.offset(k as isize + 1));
+            let misms_val = *m_misms.offset(k as isize) + 1;
+            let ins = i1_val.max(i2_val);
+            let del = d1_val.max(d2_val);
+            let mut m: WfOffset = misms_val.max(ins.max(del));
+
+            let h = wavefront_h(k, m) as u32;
+            let v = wavefront_v(k, m) as u32;
+            if h > text_length as u32 || v > pattern_length as u32 {
+                m = OFFSET_NULL;
+            }
+
+            *m_curr.offset(k as isize) = m;
+            *i1_curr.offset(k as isize) = i1_val;
+            *i2_curr.offset(k as isize) = i2_val;
+            *d1_curr.offset(k as isize) = d1_val;
+            *d2_curr.offset(k as isize) = d2_val;
+            k += 1;
+        }
     }
 }
 

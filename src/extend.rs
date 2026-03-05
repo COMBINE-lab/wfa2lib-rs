@@ -10,44 +10,52 @@ use crate::sequences::WavefrontSequences;
 use crate::termination;
 use crate::wavefront::Wavefront;
 
-/// Extend matches for end-to-end alignment (character-by-character).
+/// Extend matches for end-to-end alignment using 64-bit blockwise comparison.
 ///
 /// For each diagonal k in [lo, hi], extends the offset by comparing
 /// pattern[v..] with text[h..] where v = offset - k, h = offset.
-/// Sentinels in the padded sequence buffer guarantee safe termination.
-#[inline(never)]
+/// Uses 8-byte XOR blocks with trailing-zero count for fast matching.
+/// Sentinel characters and 64-byte padding guarantee safe termination.
+#[inline]
 pub fn extend_matches_packed_end2end(sequences: &WavefrontSequences, wf: &mut Wavefront) {
     let lo = wf.lo;
     let hi = wf.hi;
     let pattern = sequences.pattern_ptr();
     let text = sequences.text_ptr();
-    let base_k = wf.base_k();
-    let offsets = wf.offsets_slice_mut();
 
-    for k in lo..=hi {
-        let idx = (k - base_k) as usize;
-        let mut offset = offsets[idx];
-        if offset == OFFSET_NULL {
-            continue;
+    // SAFETY: Bounds guaranteed by caller (lo/hi within wavefront range).
+    // Sentinels ('!' vs '?') guarantee termination. 64-byte padding
+    // ensures reads don't go out of the allocated buffer.
+    unsafe {
+        let offsets = wf.offsets_slice_mut().as_mut_ptr().wrapping_offset(-(wf.base_k() as isize));
+
+        for k in lo..=hi {
+            let mut offset = *offsets.offset(k as isize);
+            if offset == OFFSET_NULL {
+                continue;
+            }
+
+            let mut p_ptr = pattern.as_ptr().add((offset - k) as usize);
+            let mut t_ptr = text.as_ptr().add(offset as usize);
+            loop {
+                let cmp = (p_ptr as *const u64).read_unaligned()
+                    ^ (t_ptr as *const u64).read_unaligned();
+                if cmp != 0 {
+                    offset += (cmp.trailing_zeros() / 8) as i32;
+                    break;
+                }
+                offset += 8;
+                p_ptr = p_ptr.add(8);
+                t_ptr = t_ptr.add(8);
+            }
+
+            *offsets.offset(k as isize) = offset;
         }
-
-        let mut v = (offset - k) as usize;
-        let mut h = offset as usize;
-
-        // Character-by-character comparison.
-        // Safe because sentinel chars differ between pattern ('!') and text ('?').
-        while pattern[v] == text[h] {
-            v += 1;
-            h += 1;
-            offset += 1;
-        }
-
-        offsets[idx] = offset;
     }
 }
 
 /// Extend matches and return the maximum antidiagonal reached.
-#[inline(never)]
+#[inline]
 pub fn extend_matches_packed_end2end_max(
     sequences: &WavefrontSequences,
     wf: &mut Wavefront,
@@ -56,32 +64,38 @@ pub fn extend_matches_packed_end2end_max(
     let hi = wf.hi;
     let pattern = sequences.pattern_ptr();
     let text = sequences.text_ptr();
-    let base_k = wf.base_k();
-    let offsets = wf.offsets_slice_mut();
     let mut max_antidiag: WfOffset = 0;
 
-    for k in lo..=hi {
-        let idx = (k - base_k) as usize;
-        let mut offset = offsets[idx];
-        if offset == OFFSET_NULL {
-            continue;
-        }
+    // SAFETY: Same as extend_matches_packed_end2end.
+    unsafe {
+        let offsets = wf.offsets_slice_mut().as_mut_ptr().wrapping_offset(-(wf.base_k() as isize));
 
-        let mut v = (offset - k) as usize;
-        let mut h = offset as usize;
+        for k in lo..=hi {
+            let mut offset = *offsets.offset(k as isize);
+            if offset == OFFSET_NULL {
+                continue;
+            }
 
-        while pattern[v] == text[h] {
-            v += 1;
-            h += 1;
-            offset += 1;
-        }
+            let mut p_ptr = pattern.as_ptr().add((offset - k) as usize);
+            let mut t_ptr = text.as_ptr().add(offset as usize);
+            loop {
+                let cmp = (p_ptr as *const u64).read_unaligned()
+                    ^ (t_ptr as *const u64).read_unaligned();
+                if cmp != 0 {
+                    offset += (cmp.trailing_zeros() / 8) as i32;
+                    break;
+                }
+                offset += 8;
+                p_ptr = p_ptr.add(8);
+                t_ptr = t_ptr.add(8);
+            }
 
-        offsets[idx] = offset;
+            *offsets.offset(k as isize) = offset;
 
-        // antidiagonal = 2*offset - k
-        let antidiag = 2 * offset - k;
-        if antidiag > max_antidiag {
-            max_antidiag = antidiag;
+            let antidiag = 2 * offset - k;
+            if antidiag > max_antidiag {
+                max_antidiag = antidiag;
+            }
         }
     }
 
@@ -91,7 +105,7 @@ pub fn extend_matches_packed_end2end_max(
 /// Extend matches for ends-free alignment, checking termination at each diagonal.
 ///
 /// Returns `Some((k, offset))` if a valid termination point is found, `None` otherwise.
-#[inline(never)]
+#[inline]
 pub fn extend_matches_packed_endsfree(
     sequences: &WavefrontSequences,
     wf: &mut Wavefront,
@@ -104,38 +118,44 @@ pub fn extend_matches_packed_endsfree(
     let text = sequences.text_ptr();
     let pattern_length = sequences.pattern_length;
     let text_length = sequences.text_length;
-    let base_k = wf.base_k();
-    let offsets = wf.offsets_slice_mut();
 
-    for k in lo..=hi {
-        let idx = (k - base_k) as usize;
-        let mut offset = offsets[idx];
-        if offset == OFFSET_NULL {
-            continue;
-        }
+    // SAFETY: Same as extend_matches_packed_end2end.
+    unsafe {
+        let offsets = wf.offsets_slice_mut().as_mut_ptr().wrapping_offset(-(wf.base_k() as isize));
 
-        let mut v = (offset - k) as usize;
-        let mut h = offset as usize;
+        for k in lo..=hi {
+            let mut offset = *offsets.offset(k as isize);
+            if offset == OFFSET_NULL {
+                continue;
+            }
 
-        // Character-by-character comparison (same sentinel-based loop)
-        while pattern[v] == text[h] {
-            v += 1;
-            h += 1;
-            offset += 1;
-        }
+            let mut p_ptr = pattern.as_ptr().add((offset - k) as usize);
+            let mut t_ptr = text.as_ptr().add(offset as usize);
+            loop {
+                let cmp = (p_ptr as *const u64).read_unaligned()
+                    ^ (t_ptr as *const u64).read_unaligned();
+                if cmp != 0 {
+                    offset += (cmp.trailing_zeros() / 8) as i32;
+                    break;
+                }
+                offset += 8;
+                p_ptr = p_ptr.add(8);
+                t_ptr = t_ptr.add(8);
+            }
 
-        offsets[idx] = offset;
+            *offsets.offset(k as isize) = offset;
 
-        // Check ends-free termination at this diagonal
-        if termination::termination_endsfree(
-            pattern_length,
-            text_length,
-            pattern_end_free,
-            text_end_free,
-            k,
-            offset,
-        ) {
-            return Some((k, offset));
+            // Check ends-free termination at this diagonal
+            if termination::termination_endsfree(
+                pattern_length,
+                text_length,
+                pattern_end_free,
+                text_end_free,
+                k,
+                offset,
+            ) {
+                return Some((k, offset));
+            }
         }
     }
 
@@ -145,7 +165,7 @@ pub fn extend_matches_packed_endsfree(
 // --- Custom extend functions for Lambda mode (bounds-checked, no sentinels) ---
 
 /// Extend matches for Lambda mode end-to-end alignment (bounds-checked).
-#[inline(never)]
+#[inline]
 pub fn extend_matches_custom_end2end(sequences: &WavefrontSequences, wf: &mut Wavefront) {
     let lo = wf.lo;
     let hi = wf.hi;
@@ -173,7 +193,7 @@ pub fn extend_matches_custom_end2end(sequences: &WavefrontSequences, wf: &mut Wa
 }
 
 /// Extend matches for Lambda mode and return the maximum antidiagonal reached.
-#[inline(never)]
+#[inline]
 pub fn extend_matches_custom_end2end_max(
     sequences: &WavefrontSequences,
     wf: &mut Wavefront,
@@ -212,7 +232,7 @@ pub fn extend_matches_custom_end2end_max(
 }
 
 /// Extend matches for Lambda mode ends-free alignment, checking termination.
-#[inline(never)]
+#[inline]
 pub fn extend_matches_custom_endsfree(
     sequences: &WavefrontSequences,
     wf: &mut Wavefront,

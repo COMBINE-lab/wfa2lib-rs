@@ -160,13 +160,13 @@ impl WavefrontSlab {
     /// Get a reference to a wavefront by index.
     #[inline(always)]
     pub fn get(&self, idx: WavefrontIdx) -> &Wavefront {
-        &self.wavefronts[idx]
+        unsafe { self.wavefronts.get_unchecked(idx) }
     }
 
     /// Get a mutable reference to a wavefront by index.
     #[inline(always)]
     pub fn get_mut(&mut self, idx: WavefrontIdx) -> &mut Wavefront {
-        &mut self.wavefronts[idx]
+        unsafe { self.wavefronts.get_unchecked_mut(idx) }
     }
 
     /// Get a raw mutable pointer to a wavefront by index.

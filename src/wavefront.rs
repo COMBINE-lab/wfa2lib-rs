@@ -70,8 +70,16 @@ pub struct Wavefront {
 
 impl Wavefront {
     /// Allocate a new wavefront with the given number of elements.
+    ///
+    /// # Safety invariant
+    /// The offsets array is left uninitialized for performance. Callers must
+    /// ensure all positions are written (by compute kernels) or filled (by
+    /// `init_null`/`init_ends_lower`/`init_ends_higher`) before being read.
+    /// The slab allocator + compute pipeline guarantee this invariant.
+    #[allow(clippy::uninit_vec)]
     pub fn allocate(wf_elements_allocated: i32, allocate_backtrace: bool) -> Self {
         let size = wf_elements_allocated as usize;
+        // bt_pcigar (PCIGAR_NULL=0) and bt_prev (0) use calloc-optimized zero init.
         let bt_pcigar_mem = if allocate_backtrace {
             Some(vec![PCIGAR_NULL; size])
         } else {
@@ -82,11 +90,16 @@ impl Wavefront {
         } else {
             None
         };
+        // SAFETY: offsets_mem is not read until init_null/init_ends fills the
+        // relevant range, or the compute kernel writes every position in [lo,hi].
+        // Reused wavefronts from the slab free list also skip this fill.
+        let mut offsets_mem = Vec::with_capacity(size);
+        unsafe { offsets_mem.set_len(size); }
         Self {
             null: false,
             lo: 1,
             hi: -1,
-            offsets_mem: vec![OFFSET_NULL; size],
+            offsets_mem,
             base_k: 0,
             bt_occupancy_max: 0,
             bt_pcigar_mem,
@@ -101,10 +114,14 @@ impl Wavefront {
     }
 
     /// Resize the wavefront (content is lost).
+    #[allow(clippy::uninit_vec)]
     pub fn resize(&mut self, wf_elements_allocated: i32) {
         let size = wf_elements_allocated as usize;
         self.wf_elements_allocated = wf_elements_allocated;
-        self.offsets_mem = vec![OFFSET_NULL; size];
+        // SAFETY: same invariant as allocate — offsets filled before read.
+        let mut offsets_mem = Vec::with_capacity(size);
+        unsafe { offsets_mem.set_len(size); }
+        self.offsets_mem = offsets_mem;
         if let Some(ref mut bt_pcigar) = self.bt_pcigar_mem {
             *bt_pcigar = vec![PCIGAR_NULL; size];
             *self.bt_prev_mem.as_mut().unwrap() = vec![0u32; size];
@@ -143,9 +160,7 @@ impl Wavefront {
         self.hi = -1;
         self.base_k = min_lo;
         let wf_elements = (max_hi - min_lo + 1) as usize;
-        for i in 0..wf_elements {
-            self.offsets_mem[i] = OFFSET_NULL;
-        }
+        self.offsets_mem[..wf_elements].fill(OFFSET_NULL);
         if let Some(ref mut bt_pcigar) = self.bt_pcigar_mem {
             self.bt_occupancy_max = 0;
             bt_pcigar[..wf_elements].fill(PCIGAR_NULL);
@@ -180,9 +195,9 @@ impl Wavefront {
         }
         let min_init = self.wf_elements_init_min.min(self.lo);
         let start = min_lo.max(self.wf_elements_allocated_min);
-        for k in start..min_init {
-            self.offsets_mem[(k - self.base_k) as usize] = OFFSET_NULL;
-        }
+        let from = (start - self.base_k) as usize;
+        let to = (min_init - self.base_k) as usize;
+        self.offsets_mem[from..to].fill(OFFSET_NULL);
         self.wf_elements_init_min = start;
     }
 
@@ -195,9 +210,9 @@ impl Wavefront {
         }
         let max_init = self.wf_elements_init_max.max(self.hi);
         let end = max_hi.min(self.wf_elements_allocated_max);
-        for k in (max_init + 1)..=end {
-            self.offsets_mem[(k - self.base_k) as usize] = OFFSET_NULL;
-        }
+        let from = (max_init + 1 - self.base_k) as usize;
+        let to = (end + 1 - self.base_k) as usize;
+        self.offsets_mem[from..to].fill(OFFSET_NULL);
         self.wf_elements_init_max = end;
     }
 

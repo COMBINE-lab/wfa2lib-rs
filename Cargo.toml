@@ -9,6 +9,10 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 
+[profile.release]
+lto = true
+codegen-units = 1
+
 [[bin]]
 name = "align_benchmark"
 path = "src/bin/align_benchmark.rs"

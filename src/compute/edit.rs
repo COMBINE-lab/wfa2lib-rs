@@ -3,7 +3,7 @@
 use crate::offset::{OFFSET_NULL, WfOffset, wavefront_h, wavefront_v};
 use crate::wavefront::Wavefront;
 
-/// Edit distance compute kernel (no backtrace).
+/// Edit distance compute kernel (NEON-vectorized on aarch64).
 ///
 /// For each diagonal k in [lo, hi]:
 ///   ins   = prev[k-1]     (insertion: advance text)
@@ -12,7 +12,7 @@ use crate::wavefront::Wavefront;
 ///   curr[k] = max(del, max(ins, misms) + 1)
 ///
 /// Out-of-bounds offsets are set to OFFSET_NULL.
-#[inline(never)]
+#[inline]
 pub fn compute_edit_idm(
     pattern_length: i32,
     text_length: i32,
@@ -21,38 +21,72 @@ pub fn compute_edit_idm(
     lo: i32,
     hi: i32,
 ) {
-    let prev_offsets = wf_prev.offsets_slice();
-    let prev_base = wf_prev.base_k();
-    let curr_base = wf_curr.base_k();
-    let curr_offsets = wf_curr.offsets_slice_mut();
+    // SAFETY: Bounds guaranteed by caller (lo/hi clamped, init_ends called).
+    unsafe {
+        let prev = wf_prev.offsets_slice().as_ptr().wrapping_offset(-(wf_prev.base_k() as isize));
+        let curr = wf_curr.offsets_slice_mut().as_mut_ptr().wrapping_offset(-(wf_curr.base_k() as isize));
 
-    for k in lo..=hi {
-        let ins = prev_offsets[((k - 1) - prev_base) as usize];
-        let del = prev_offsets[((k + 1) - prev_base) as usize];
-        let misms = prev_offsets[(k - prev_base) as usize];
-        let mut max = del.max(ins.max(misms) + 1);
+        let count = hi - lo + 1;
+        let mut k = lo;
 
-        // Bounds check using unsigned cast (catches negative values too)
-        let h = wavefront_h(k, max) as u32;
-        let v = wavefront_v(k, max) as u32;
-        if h > text_length as u32 {
-            max = OFFSET_NULL;
+        #[cfg(target_arch = "aarch64")]
+        {
+            use std::arch::aarch64::*;
+            if count >= 4 {
+                unsafe {
+                    let v_one = vdupq_n_s32(1);
+                    let v_four = vdupq_n_s32(4);
+                    let v_null = vdupq_n_s32(OFFSET_NULL);
+                    let v_tlen = vdupq_n_u32(text_length as u32);
+                    let v_plen = vdupq_n_u32(pattern_length as u32);
+                    let k_base: [i32; 4] = [0, 1, 2, 3];
+                    let mut v_k = vaddq_s32(vdupq_n_s32(lo), vld1q_s32(k_base.as_ptr()));
+                    let neon_end = lo + (count & !3);
+
+                    while k < neon_end {
+                        let v_ins = vld1q_s32(prev.offset(k as isize - 1));
+                        let v_del = vld1q_s32(prev.offset(k as isize + 1));
+                        let v_misms = vld1q_s32(prev.offset(k as isize));
+                        let v_max = vmaxq_s32(v_del, vaddq_s32(vmaxq_s32(v_ins, v_misms), v_one));
+
+                        let v_h = vreinterpretq_u32_s32(v_max);
+                        let v_v = vreinterpretq_u32_s32(vsubq_s32(v_max, v_k));
+                        let oob = vorrq_u32(vcgtq_u32(v_h, v_tlen), vcgtq_u32(v_v, v_plen));
+                        let v_result = vbslq_s32(oob, v_null, v_max);
+
+                        vst1q_s32(curr.offset(k as isize), v_result);
+                        k += 4;
+                        v_k = vaddq_s32(v_k, v_four);
+                    }
+                }
+            }
         }
-        if v > pattern_length as u32 {
-            max = OFFSET_NULL;
-        }
 
-        curr_offsets[(k - curr_base) as usize] = max;
+        while k <= hi {
+            let ins = *prev.offset(k as isize - 1);
+            let del = *prev.offset(k as isize + 1);
+            let misms = *prev.offset(k as isize);
+            let mut max = del.max(ins.max(misms) + 1);
+
+            let h = wavefront_h(k, max) as u32;
+            let v = wavefront_v(k, max) as u32;
+            if h > text_length as u32 || v > pattern_length as u32 {
+                max = OFFSET_NULL;
+            }
+
+            *curr.offset(k as isize) = max;
+            k += 1;
+        }
     }
 }
 
-/// Indel distance compute kernel (no backtrace).
+/// Indel distance compute kernel (NEON-vectorized on aarch64).
 ///
 /// For each diagonal k in [lo, hi]:
 ///   ins   = prev[k-1] + 1  (insertion)
 ///   del   = prev[k+1]      (deletion)
 ///   curr[k] = max(del, ins)
-#[inline(never)]
+#[inline]
 pub fn compute_indel_idm(
     pattern_length: i32,
     text_length: i32,
@@ -61,26 +95,60 @@ pub fn compute_indel_idm(
     lo: i32,
     hi: i32,
 ) {
-    let prev_offsets = wf_prev.offsets_slice();
-    let prev_base = wf_prev.base_k();
-    let curr_base = wf_curr.base_k();
-    let curr_offsets = wf_curr.offsets_slice_mut();
+    // SAFETY: Bounds guaranteed by caller (lo/hi clamped, init_ends called).
+    unsafe {
+        let prev = wf_prev.offsets_slice().as_ptr().wrapping_offset(-(wf_prev.base_k() as isize));
+        let curr = wf_curr.offsets_slice_mut().as_mut_ptr().wrapping_offset(-(wf_curr.base_k() as isize));
 
-    for k in lo..=hi {
-        let ins = prev_offsets[((k - 1) - prev_base) as usize] + 1;
-        let del = prev_offsets[((k + 1) - prev_base) as usize];
-        let mut max: WfOffset = del.max(ins);
+        let count = hi - lo + 1;
+        let mut k = lo;
 
-        let h = wavefront_h(k, max) as u32;
-        let v = wavefront_v(k, max) as u32;
-        if h > text_length as u32 {
-            max = OFFSET_NULL;
+        #[cfg(target_arch = "aarch64")]
+        {
+            use std::arch::aarch64::*;
+            if count >= 4 {
+                unsafe {
+                    let v_one = vdupq_n_s32(1);
+                    let v_four = vdupq_n_s32(4);
+                    let v_null = vdupq_n_s32(OFFSET_NULL);
+                    let v_tlen = vdupq_n_u32(text_length as u32);
+                    let v_plen = vdupq_n_u32(pattern_length as u32);
+                    let k_base: [i32; 4] = [0, 1, 2, 3];
+                    let mut v_k = vaddq_s32(vdupq_n_s32(lo), vld1q_s32(k_base.as_ptr()));
+                    let neon_end = lo + (count & !3);
+
+                    while k < neon_end {
+                        let v_ins = vaddq_s32(vld1q_s32(prev.offset(k as isize - 1)), v_one);
+                        let v_del = vld1q_s32(prev.offset(k as isize + 1));
+                        let v_max = vmaxq_s32(v_del, v_ins);
+
+                        let v_h = vreinterpretq_u32_s32(v_max);
+                        let v_v = vreinterpretq_u32_s32(vsubq_s32(v_max, v_k));
+                        let oob = vorrq_u32(vcgtq_u32(v_h, v_tlen), vcgtq_u32(v_v, v_plen));
+                        let v_result = vbslq_s32(oob, v_null, v_max);
+
+                        vst1q_s32(curr.offset(k as isize), v_result);
+                        k += 4;
+                        v_k = vaddq_s32(v_k, v_four);
+                    }
+                }
+            }
         }
-        if v > pattern_length as u32 {
-            max = OFFSET_NULL;
-        }
 
-        curr_offsets[(k - curr_base) as usize] = max;
+        while k <= hi {
+            let ins = *prev.offset(k as isize - 1) + 1;
+            let del = *prev.offset(k as isize + 1);
+            let mut max: WfOffset = del.max(ins);
+
+            let h = wavefront_h(k, max) as u32;
+            let v = wavefront_v(k, max) as u32;
+            if h > text_length as u32 || v > pattern_length as u32 {
+                max = OFFSET_NULL;
+            }
+
+            *curr.offset(k as isize) = max;
+            k += 1;
+        }
     }
 }
 

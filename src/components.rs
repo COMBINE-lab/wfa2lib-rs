@@ -191,9 +191,9 @@ impl WavefrontComponents {
     #[inline(always)]
     pub fn get_m_idx(&self, score: usize) -> WavefrontIdx {
         if self.memory_modular {
-            self.mwavefronts[score % self.max_score_scope]
+            unsafe { *self.mwavefronts.get_unchecked(score % self.max_score_scope) }
         } else if score < self.mwavefronts.len() {
-            self.mwavefronts[score]
+            unsafe { *self.mwavefronts.get_unchecked(score) }
         } else {
             WAVEFRONT_IDX_NONE
         }
@@ -219,9 +219,9 @@ impl WavefrontComponents {
             return WAVEFRONT_IDX_NONE;
         }
         if self.memory_modular {
-            self.i1wavefronts[score % self.max_score_scope]
+            unsafe { *self.i1wavefronts.get_unchecked(score % self.max_score_scope) }
         } else if score < self.i1wavefronts.len() {
-            self.i1wavefronts[score]
+            unsafe { *self.i1wavefronts.get_unchecked(score) }
         } else {
             WAVEFRONT_IDX_NONE
         }
@@ -247,9 +247,9 @@ impl WavefrontComponents {
             return WAVEFRONT_IDX_NONE;
         }
         if self.memory_modular {
-            self.d1wavefronts[score % self.max_score_scope]
+            unsafe { *self.d1wavefronts.get_unchecked(score % self.max_score_scope) }
         } else if score < self.d1wavefronts.len() {
-            self.d1wavefronts[score]
+            unsafe { *self.d1wavefronts.get_unchecked(score) }
         } else {
             WAVEFRONT_IDX_NONE
         }
@@ -275,9 +275,9 @@ impl WavefrontComponents {
             return WAVEFRONT_IDX_NONE;
         }
         if self.memory_modular {
-            self.i2wavefronts[score % self.max_score_scope]
+            unsafe { *self.i2wavefronts.get_unchecked(score % self.max_score_scope) }
         } else if score < self.i2wavefronts.len() {
-            self.i2wavefronts[score]
+            unsafe { *self.i2wavefronts.get_unchecked(score) }
         } else {
             WAVEFRONT_IDX_NONE
         }
@@ -303,9 +303,9 @@ impl WavefrontComponents {
             return WAVEFRONT_IDX_NONE;
         }
         if self.memory_modular {
-            self.d2wavefronts[score % self.max_score_scope]
+            unsafe { *self.d2wavefronts.get_unchecked(score % self.max_score_scope) }
         } else if score < self.d2wavefronts.len() {
-            self.d2wavefronts[score]
+            unsafe { *self.d2wavefronts.get_unchecked(score) }
         } else {
             WAVEFRONT_IDX_NONE
         }
