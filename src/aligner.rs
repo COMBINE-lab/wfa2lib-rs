@@ -890,23 +890,39 @@ impl WavefrontAligner {
             WAVEFRONT_IDX_NONE
         };
 
-        // Compute effective lo/hi from all input wavefronts
+        // Cache raw pointers to input wavefronts once; reuse for lo/hi, init_ends, and kernel.
+        // SAFETY: slab.wavefronts is pre-reserved (no reallocation during this step),
+        // and resize_null_victim only modifies WavefrontComponents inline fields (not the slab).
+        let ptr_m_misms = if m_misms_idx != WAVEFRONT_IDX_NONE {
+            unsafe { self.wavefront_slab.get_raw_mut(m_misms_idx) }
+        } else {
+            std::ptr::null_mut()
+        };
+        let ptr_m_open = if m_open_idx != WAVEFRONT_IDX_NONE {
+            unsafe { self.wavefront_slab.get_raw_mut(m_open_idx) }
+        } else {
+            std::ptr::null_mut()
+        };
+        let ptr_i1_ext = if i1_ext_idx != WAVEFRONT_IDX_NONE {
+            unsafe { self.wavefront_slab.get_raw_mut(i1_ext_idx) }
+        } else {
+            std::ptr::null_mut()
+        };
+        let ptr_d1_ext = if d1_ext_idx != WAVEFRONT_IDX_NONE {
+            unsafe { self.wavefront_slab.get_raw_mut(d1_ext_idx) }
+        } else {
+            std::ptr::null_mut()
+        };
+
+        // Compute effective lo/hi from cached pointers (no slab re-lookup)
         let mut lo = i32::MAX;
         let mut hi = i32::MIN;
-
-        macro_rules! update_lohi {
-            ($idx:expr, $lo_d:expr, $hi_d:expr) => {
-                if $idx != WAVEFRONT_IDX_NONE {
-                    let wf = self.wavefront_slab.get($idx);
-                    lo = lo.min(wf.lo + $lo_d);
-                    hi = hi.max(wf.hi + $hi_d);
-                }
-            };
+        unsafe {
+            if !ptr_m_misms.is_null() { lo = lo.min((*ptr_m_misms).lo);     hi = hi.max((*ptr_m_misms).hi);     }
+            if !ptr_m_open.is_null()  { lo = lo.min((*ptr_m_open).lo - 1);  hi = hi.max((*ptr_m_open).hi + 1);  }
+            if !ptr_i1_ext.is_null()  { lo = lo.min((*ptr_i1_ext).lo + 1);  hi = hi.max((*ptr_i1_ext).hi + 1);  }
+            if !ptr_d1_ext.is_null()  { lo = lo.min((*ptr_d1_ext).lo - 1);  hi = hi.max((*ptr_d1_ext).hi - 1);  }
         }
-        update_lohi!(m_misms_idx, 0, 0);
-        update_lohi!(m_open_idx, -1, 1);
-        update_lohi!(i1_ext_idx, 1, 1);
-        update_lohi!(d1_ext_idx, -1, -1);
 
         if lo > hi {
             // No valid inputs — free old modular slot and set to none
@@ -932,31 +948,15 @@ impl WavefrontAligner {
         // Ensure null/victim wavefronts cover the range
         self.wf_components.resize_null_victim(lo, hi);
 
-        // Initialize input wavefront ends
-        if m_misms_idx != WAVEFRONT_IDX_NONE {
-            let wf = self.wavefront_slab.get_mut(m_misms_idx);
-            wf.init_ends_higher(hi);
-            wf.init_ends_lower(lo);
-        }
-        if m_open_idx != WAVEFRONT_IDX_NONE {
-            let wf = self.wavefront_slab.get_mut(m_open_idx);
-            wf.init_ends_higher(hi + 1);
-            wf.init_ends_lower(lo - 1);
-        }
-        if i1_ext_idx != WAVEFRONT_IDX_NONE {
-            let wf = self.wavefront_slab.get_mut(i1_ext_idx);
-            wf.init_ends_higher(hi);
-            wf.init_ends_lower(lo - 1);
-        }
-        if d1_ext_idx != WAVEFRONT_IDX_NONE {
-            let wf = self.wavefront_slab.get_mut(d1_ext_idx);
-            wf.init_ends_higher(hi + 1);
-            wf.init_ends_lower(lo);
+        // Initialize input wavefront ends using cached raw pointers (no slab re-lookup)
+        unsafe {
+            if !ptr_m_misms.is_null() { (*ptr_m_misms).init_ends_higher(hi);     (*ptr_m_misms).init_ends_lower(lo);     }
+            if !ptr_m_open.is_null()  { (*ptr_m_open).init_ends_higher(hi + 1);  (*ptr_m_open).init_ends_lower(lo - 1);  }
+            if !ptr_i1_ext.is_null()  { (*ptr_i1_ext).init_ends_higher(hi);      (*ptr_i1_ext).init_ends_lower(lo - 1);  }
+            if !ptr_d1_ext.is_null()  { (*ptr_d1_ext).init_ends_higher(hi + 1);  (*ptr_d1_ext).init_ends_lower(lo);      }
         }
 
         // Allocate or reuse 3 output wavefronts
-        let hist_lo = self.wf_components.historic_min_lo;
-        let hist_hi = self.wf_components.historic_max_hi;
         let (m_curr_idx, i1_curr_idx, d1_curr_idx) = if self.wf_components.memory_modular {
             let old_m = self.wf_components.get_m_idx(score_curr);
             let old_i1 = self.wf_components.get_i1_idx(score_curr);
@@ -974,47 +974,23 @@ impl WavefrontAligner {
             )
         };
 
-        {
-            let wf = self.wavefront_slab.get_mut(m_curr_idx);
-            wf.set_limits(lo, hi);
-        }
-        {
-            let wf = self.wavefront_slab.get_mut(i1_curr_idx);
-            wf.set_limits(lo, hi);
-        }
-        {
-            let wf = self.wavefront_slab.get_mut(d1_curr_idx);
-            wf.set_limits(lo, hi);
-        }
-
         // Compute kernel using raw pointers for multi-borrow
+        // Input ptrs reuse cached pointers (no extra slab lookups); outputs are fresh.
         unsafe {
             let null_wf = &self.wf_components.wavefront_null as *const _;
-
-            let wf_m_misms = if m_misms_idx != WAVEFRONT_IDX_NONE {
-                self.wavefront_slab.get(m_misms_idx) as *const _
-            } else {
-                null_wf
-            };
-            let wf_m_open = if m_open_idx != WAVEFRONT_IDX_NONE {
-                self.wavefront_slab.get(m_open_idx) as *const _
-            } else {
-                null_wf
-            };
-            let wf_i1_ext = if i1_ext_idx != WAVEFRONT_IDX_NONE {
-                self.wavefront_slab.get(i1_ext_idx) as *const _
-            } else {
-                null_wf
-            };
-            let wf_d1_ext = if d1_ext_idx != WAVEFRONT_IDX_NONE {
-                self.wavefront_slab.get(d1_ext_idx) as *const _
-            } else {
-                null_wf
-            };
+            let wf_m_misms = if !ptr_m_misms.is_null() { ptr_m_misms as *const _ } else { null_wf };
+            let wf_m_open  = if !ptr_m_open.is_null()  { ptr_m_open  as *const _ } else { null_wf };
+            let wf_i1_ext  = if !ptr_i1_ext.is_null()  { ptr_i1_ext  as *const _ } else { null_wf };
+            let wf_d1_ext  = if !ptr_d1_ext.is_null()  { ptr_d1_ext  as *const _ } else { null_wf };
 
             let m_curr_ptr = self.wavefront_slab.get_raw_mut(m_curr_idx);
             let i1_curr_ptr = self.wavefront_slab.get_raw_mut(i1_curr_idx);
             let d1_curr_ptr = self.wavefront_slab.get_raw_mut(d1_curr_idx);
+
+            // set_limits on output wavefronts via their raw ptrs (avoids 3 more slab lookups)
+            (*m_curr_ptr).set_limits(lo, hi);
+            (*i1_curr_ptr).set_limits(lo, hi);
+            (*d1_curr_ptr).set_limits(lo, hi);
 
             affine::compute_affine_idm(
                 plen,
@@ -1098,26 +1074,28 @@ impl WavefrontAligner {
             WAVEFRONT_IDX_NONE
         };
 
-        // Compute effective lo/hi from all input wavefronts
+        // Cache raw pointers to all 7 input wavefronts once; reuse for lo/hi, init_ends, and kernel.
+        // SAFETY: slab.wavefronts is pre-reserved; resize_null_victim does not touch the slab.
+        let ptr_m_misms = if m_misms_idx != WAVEFRONT_IDX_NONE { unsafe { self.wavefront_slab.get_raw_mut(m_misms_idx) } } else { std::ptr::null_mut() };
+        let ptr_m_open1 = if m_open1_idx != WAVEFRONT_IDX_NONE { unsafe { self.wavefront_slab.get_raw_mut(m_open1_idx) } } else { std::ptr::null_mut() };
+        let ptr_m_open2 = if m_open2_idx != WAVEFRONT_IDX_NONE { unsafe { self.wavefront_slab.get_raw_mut(m_open2_idx) } } else { std::ptr::null_mut() };
+        let ptr_i1_ext  = if i1_ext_idx  != WAVEFRONT_IDX_NONE { unsafe { self.wavefront_slab.get_raw_mut(i1_ext_idx)  } } else { std::ptr::null_mut() };
+        let ptr_i2_ext  = if i2_ext_idx  != WAVEFRONT_IDX_NONE { unsafe { self.wavefront_slab.get_raw_mut(i2_ext_idx)  } } else { std::ptr::null_mut() };
+        let ptr_d1_ext  = if d1_ext_idx  != WAVEFRONT_IDX_NONE { unsafe { self.wavefront_slab.get_raw_mut(d1_ext_idx)  } } else { std::ptr::null_mut() };
+        let ptr_d2_ext  = if d2_ext_idx  != WAVEFRONT_IDX_NONE { unsafe { self.wavefront_slab.get_raw_mut(d2_ext_idx)  } } else { std::ptr::null_mut() };
+
+        // Compute effective lo/hi from cached pointers (no slab re-lookup)
         let mut lo = i32::MAX;
         let mut hi = i32::MIN;
-
-        macro_rules! update_lohi {
-            ($idx:expr, $lo_d:expr, $hi_d:expr) => {
-                if $idx != WAVEFRONT_IDX_NONE {
-                    let wf = self.wavefront_slab.get($idx);
-                    lo = lo.min(wf.lo + $lo_d);
-                    hi = hi.max(wf.hi + $hi_d);
-                }
-            };
+        unsafe {
+            if !ptr_m_misms.is_null() { lo = lo.min((*ptr_m_misms).lo);     hi = hi.max((*ptr_m_misms).hi);     }
+            if !ptr_m_open1.is_null() { lo = lo.min((*ptr_m_open1).lo - 1); hi = hi.max((*ptr_m_open1).hi + 1); }
+            if !ptr_m_open2.is_null() { lo = lo.min((*ptr_m_open2).lo - 1); hi = hi.max((*ptr_m_open2).hi + 1); }
+            if !ptr_i1_ext.is_null()  { lo = lo.min((*ptr_i1_ext).lo  + 1); hi = hi.max((*ptr_i1_ext).hi  + 1); }
+            if !ptr_i2_ext.is_null()  { lo = lo.min((*ptr_i2_ext).lo  + 1); hi = hi.max((*ptr_i2_ext).hi  + 1); }
+            if !ptr_d1_ext.is_null()  { lo = lo.min((*ptr_d1_ext).lo  - 1); hi = hi.max((*ptr_d1_ext).hi  - 1); }
+            if !ptr_d2_ext.is_null()  { lo = lo.min((*ptr_d2_ext).lo  - 1); hi = hi.max((*ptr_d2_ext).hi  - 1); }
         }
-        update_lohi!(m_misms_idx, 0, 0);
-        update_lohi!(m_open1_idx, -1, 1);
-        update_lohi!(m_open2_idx, -1, 1);
-        update_lohi!(i1_ext_idx, 1, 1);
-        update_lohi!(i2_ext_idx, 1, 1);
-        update_lohi!(d1_ext_idx, -1, -1);
-        update_lohi!(d2_ext_idx, -1, -1);
 
         if lo > hi {
             if self.wf_components.memory_modular {
@@ -1142,48 +1120,15 @@ impl WavefrontAligner {
         // Ensure null/victim wavefronts cover the range
         self.wf_components.resize_null_victim(lo, hi);
 
-        // Initialize input wavefront ends
-        // m_misms: kernel reads at k → needs [lo, hi]
-        if m_misms_idx != WAVEFRONT_IDX_NONE {
-            let wf = self.wavefront_slab.get_mut(m_misms_idx);
-            wf.init_ends_higher(hi);
-            wf.init_ends_lower(lo);
-        }
-        // m_open1: kernel reads at k-1 and k+1 → needs [lo-1, hi+1]
-        if m_open1_idx != WAVEFRONT_IDX_NONE {
-            let wf = self.wavefront_slab.get_mut(m_open1_idx);
-            wf.init_ends_higher(hi + 1);
-            wf.init_ends_lower(lo - 1);
-        }
-        // m_open2: kernel reads at k-1 and k+1 → needs [lo-1, hi+1]
-        if m_open2_idx != WAVEFRONT_IDX_NONE {
-            let wf = self.wavefront_slab.get_mut(m_open2_idx);
-            wf.init_ends_higher(hi + 1);
-            wf.init_ends_lower(lo - 1);
-        }
-        // i1_ext: kernel reads at k-1 → needs [lo-1, hi]
-        if i1_ext_idx != WAVEFRONT_IDX_NONE {
-            let wf = self.wavefront_slab.get_mut(i1_ext_idx);
-            wf.init_ends_higher(hi);
-            wf.init_ends_lower(lo - 1);
-        }
-        // i2_ext: kernel reads at k-1 → needs [lo-1, hi]
-        if i2_ext_idx != WAVEFRONT_IDX_NONE {
-            let wf = self.wavefront_slab.get_mut(i2_ext_idx);
-            wf.init_ends_higher(hi);
-            wf.init_ends_lower(lo - 1);
-        }
-        // d1_ext: kernel reads at k+1 → needs [lo, hi+1]
-        if d1_ext_idx != WAVEFRONT_IDX_NONE {
-            let wf = self.wavefront_slab.get_mut(d1_ext_idx);
-            wf.init_ends_higher(hi + 1);
-            wf.init_ends_lower(lo);
-        }
-        // d2_ext: kernel reads at k+1 → needs [lo, hi+1]
-        if d2_ext_idx != WAVEFRONT_IDX_NONE {
-            let wf = self.wavefront_slab.get_mut(d2_ext_idx);
-            wf.init_ends_higher(hi + 1);
-            wf.init_ends_lower(lo);
+        // Initialize input wavefront ends using cached raw pointers (no slab re-lookup)
+        unsafe {
+            if !ptr_m_misms.is_null() { (*ptr_m_misms).init_ends_higher(hi);     (*ptr_m_misms).init_ends_lower(lo);     }
+            if !ptr_m_open1.is_null() { (*ptr_m_open1).init_ends_higher(hi + 1); (*ptr_m_open1).init_ends_lower(lo - 1); }
+            if !ptr_m_open2.is_null() { (*ptr_m_open2).init_ends_higher(hi + 1); (*ptr_m_open2).init_ends_lower(lo - 1); }
+            if !ptr_i1_ext.is_null()  { (*ptr_i1_ext).init_ends_higher(hi);      (*ptr_i1_ext).init_ends_lower(lo - 1);  }
+            if !ptr_i2_ext.is_null()  { (*ptr_i2_ext).init_ends_higher(hi);      (*ptr_i2_ext).init_ends_lower(lo - 1);  }
+            if !ptr_d1_ext.is_null()  { (*ptr_d1_ext).init_ends_higher(hi + 1);  (*ptr_d1_ext).init_ends_lower(lo);      }
+            if !ptr_d2_ext.is_null()  { (*ptr_d2_ext).init_ends_higher(hi + 1);  (*ptr_d2_ext).init_ends_lower(lo);      }
         }
 
         // Allocate or reuse 5 output wavefronts
@@ -1211,72 +1156,30 @@ impl WavefrontAligner {
                 )
             };
 
-        {
-            let wf = self.wavefront_slab.get_mut(m_curr_idx);
-            wf.set_limits(lo, hi);
-        }
-        {
-            let wf = self.wavefront_slab.get_mut(i1_curr_idx);
-            wf.set_limits(lo, hi);
-        }
-        {
-            let wf = self.wavefront_slab.get_mut(i2_curr_idx);
-            wf.set_limits(lo, hi);
-        }
-        {
-            let wf = self.wavefront_slab.get_mut(d1_curr_idx);
-            wf.set_limits(lo, hi);
-        }
-        {
-            let wf = self.wavefront_slab.get_mut(d2_curr_idx);
-            wf.set_limits(lo, hi);
-        }
-
         // Compute kernel using raw pointers for multi-borrow
+        // Input ptrs reuse cached pointers (no extra slab lookups); outputs are fresh.
         unsafe {
             let null_wf = &self.wf_components.wavefront_null as *const _;
-
-            let wf_m_misms = if m_misms_idx != WAVEFRONT_IDX_NONE {
-                self.wavefront_slab.get(m_misms_idx) as *const _
-            } else {
-                null_wf
-            };
-            let wf_m_open1 = if m_open1_idx != WAVEFRONT_IDX_NONE {
-                self.wavefront_slab.get(m_open1_idx) as *const _
-            } else {
-                null_wf
-            };
-            let wf_m_open2 = if m_open2_idx != WAVEFRONT_IDX_NONE {
-                self.wavefront_slab.get(m_open2_idx) as *const _
-            } else {
-                null_wf
-            };
-            let wf_i1_ext = if i1_ext_idx != WAVEFRONT_IDX_NONE {
-                self.wavefront_slab.get(i1_ext_idx) as *const _
-            } else {
-                null_wf
-            };
-            let wf_i2_ext = if i2_ext_idx != WAVEFRONT_IDX_NONE {
-                self.wavefront_slab.get(i2_ext_idx) as *const _
-            } else {
-                null_wf
-            };
-            let wf_d1_ext = if d1_ext_idx != WAVEFRONT_IDX_NONE {
-                self.wavefront_slab.get(d1_ext_idx) as *const _
-            } else {
-                null_wf
-            };
-            let wf_d2_ext = if d2_ext_idx != WAVEFRONT_IDX_NONE {
-                self.wavefront_slab.get(d2_ext_idx) as *const _
-            } else {
-                null_wf
-            };
+            let wf_m_misms = if !ptr_m_misms.is_null() { ptr_m_misms as *const _ } else { null_wf };
+            let wf_m_open1 = if !ptr_m_open1.is_null() { ptr_m_open1 as *const _ } else { null_wf };
+            let wf_m_open2 = if !ptr_m_open2.is_null() { ptr_m_open2 as *const _ } else { null_wf };
+            let wf_i1_ext  = if !ptr_i1_ext.is_null()  { ptr_i1_ext  as *const _ } else { null_wf };
+            let wf_i2_ext  = if !ptr_i2_ext.is_null()  { ptr_i2_ext  as *const _ } else { null_wf };
+            let wf_d1_ext  = if !ptr_d1_ext.is_null()  { ptr_d1_ext  as *const _ } else { null_wf };
+            let wf_d2_ext  = if !ptr_d2_ext.is_null()  { ptr_d2_ext  as *const _ } else { null_wf };
 
             let m_curr_ptr = self.wavefront_slab.get_raw_mut(m_curr_idx);
             let i1_curr_ptr = self.wavefront_slab.get_raw_mut(i1_curr_idx);
             let i2_curr_ptr = self.wavefront_slab.get_raw_mut(i2_curr_idx);
             let d1_curr_ptr = self.wavefront_slab.get_raw_mut(d1_curr_idx);
             let d2_curr_ptr = self.wavefront_slab.get_raw_mut(d2_curr_idx);
+
+            // set_limits on output wavefronts via raw ptrs (avoids 5 more slab lookups)
+            (*m_curr_ptr).set_limits(lo, hi);
+            (*i1_curr_ptr).set_limits(lo, hi);
+            (*i2_curr_ptr).set_limits(lo, hi);
+            (*d1_curr_ptr).set_limits(lo, hi);
+            (*d2_curr_ptr).set_limits(lo, hi);
 
             affine2p::compute_affine2p_idm(
                 plen,
