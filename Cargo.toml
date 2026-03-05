@@ -4,9 +4,13 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
 
+[features]
+default = ["mimalloc-alloc"]
+mimalloc-alloc = ["mimalloc"]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-mimalloc = "0.1"
+mimalloc = { version = "0.1", optional = true }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 
