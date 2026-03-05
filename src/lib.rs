@@ -1,4 +1,5 @@
 pub mod aligner;
+pub mod arena;
 pub mod backtrace;
 pub mod bialign;
 pub mod bt_buffer;

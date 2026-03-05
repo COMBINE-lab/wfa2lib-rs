@@ -5,6 +5,7 @@
 //! - `Reuse`: keeps all wavefronts, grows slab size dynamically
 //! - `Tight`: reaps wavefronts when size changes, keeps only init-sized ones
 
+use crate::arena::OffsetArena;
 use crate::offset::wavefront_length;
 use crate::wavefront::{Wavefront, WavefrontStatus};
 
@@ -41,11 +42,15 @@ pub struct WavefrontSlab {
     free_list: Vec<WavefrontIdx>,
     /// Total memory used in bytes.
     memory_used: u64,
+    /// Arena for wavefront offset arrays (contiguous bump allocation).
+    arena: OffsetArena,
 }
 
 impl WavefrontSlab {
     /// Create a new slab.
     pub fn new(init_wf_length: i32, allocate_backtrace: bool, slab_mode: SlabMode) -> Self {
+        // Initial arena: enough for ~50 wavefronts at init size.
+        let arena_capacity = (init_wf_length as usize) * 50;
         Self {
             allocate_backtrace,
             slab_mode,
@@ -54,6 +59,7 @@ impl WavefrontSlab {
             wavefronts: Vec::with_capacity(100),
             free_list: Vec::with_capacity(100),
             memory_used: 0,
+            arena: OffsetArena::new(arena_capacity.max(4096)),
         }
     }
 
@@ -156,18 +162,24 @@ impl WavefrontSlab {
     /// Reset to initial size and repurpose all wavefronts.
     pub fn reap(&mut self) {
         self.current_wf_length = self.init_wf_length;
-        self.reap_repurpose();
+        // With arena, just clear everything and reset
+        self.wavefronts.clear();
+        self.free_list.clear();
+        self.memory_used = 0;
+        self.arena.reset();
     }
 
-    /// Clear the slab according to its mode.
+    /// Clear the slab according to its mode. Resets the arena.
     pub fn clear(&mut self) {
+        // Drop all wavefronts (arena-backed offsets will NOT be dealloc'd).
+        self.wavefronts.clear();
+        self.free_list.clear();
+        self.memory_used = 0;
+        self.arena.reset();
         match self.slab_mode {
-            SlabMode::Reuse => {
-                self.reap_repurpose();
-            }
+            SlabMode::Reuse => {}
             SlabMode::Tight => {
                 self.current_wf_length = self.init_wf_length;
-                self.reap_repurpose();
             }
         }
     }
@@ -243,7 +255,8 @@ impl WavefrontSlab {
     // --- Internal ---
 
     fn allocate_new(&mut self, wf_length: i32, min_lo: i32, max_hi: i32) -> WavefrontIdx {
-        let mut wf = Wavefront::allocate(wf_length, self.allocate_backtrace);
+        let mut wf =
+            Wavefront::allocate_from_arena(&mut self.arena, wf_length, self.allocate_backtrace);
         wf.status = WavefrontStatus::Busy;
         wf.init(min_lo, max_hi);
         self.memory_used += wf.get_size();
@@ -253,39 +266,33 @@ impl WavefrontSlab {
     }
 
     /// Remove deallocated and free wavefronts (Reuse mode reap).
+    /// With arena, keep busy wavefronts and their offset pointers (still valid).
+    /// Dead space from freed wavefronts is reclaimed on the next clear().
     fn reap_free(&mut self) {
         self.free_list.clear();
         let mut valid_idx = 0;
         for i in 0..self.wavefronts.len() {
-            match self.wavefronts[i].status {
-                WavefrontStatus::Deallocated => {
-                    // Drop
+            if self.wavefronts[i].status == WavefrontStatus::Busy {
+                if valid_idx != i {
+                    self.wavefronts.swap(valid_idx, i);
                 }
-                WavefrontStatus::Busy => {
-                    if valid_idx != i {
-                        self.wavefronts.swap(valid_idx, i);
-                    }
-                    valid_idx += 1;
-                }
-                WavefrontStatus::Free => {
-                    self.memory_used -= self.wavefronts[i].get_size();
-                    // Will be dropped
-                }
+                valid_idx += 1;
             }
+            // Free and Deallocated wavefronts: metadata dropped, offset memory
+            // becomes arena dead space (reclaimed on arena.reset()).
         }
         self.wavefronts.truncate(valid_idx);
     }
 
     /// Repurpose wavefronts matching current_wf_length; remove others.
+    /// Offset pointers remain valid in the arena (not reset here).
     fn reap_repurpose(&mut self) {
         self.free_list.clear();
         let current_wf_length = self.current_wf_length;
         let mut valid_idx = 0;
         for i in 0..self.wavefronts.len() {
             match self.wavefronts[i].status {
-                WavefrontStatus::Deallocated => {
-                    // Drop
-                }
+                WavefrontStatus::Deallocated => {}
                 WavefrontStatus::Busy | WavefrontStatus::Free => {
                     if self.wavefronts[i].wf_elements_allocated == current_wf_length {
                         self.wavefronts[i].status = WavefrontStatus::Free;
@@ -294,10 +301,8 @@ impl WavefrontSlab {
                         }
                         self.free_list.push(valid_idx);
                         valid_idx += 1;
-                    } else {
-                        self.memory_used -= self.wavefronts[i].get_size();
-                        // Will be dropped
                     }
+                    // Non-matching wavefronts: dropped, arena space reclaimed on reset
                 }
             }
         }
@@ -416,8 +421,11 @@ mod tests {
             slab.allocate(-5, 5);
         }
         slab.clear();
-        // Wavefronts matching current_wf_length are repurposed as free
-        assert_eq!(slab.num_wavefronts(), 5);
-        assert_eq!(slab.num_free(), 5);
+        // Arena clear drops all wavefronts and resets arena
+        assert_eq!(slab.num_wavefronts(), 0);
+        assert_eq!(slab.num_free(), 0);
+        // Can allocate again from fresh arena
+        let idx = slab.allocate(-5, 5);
+        assert_eq!(slab.get(idx).status, WavefrontStatus::Busy);
     }
 }

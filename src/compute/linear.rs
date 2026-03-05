@@ -40,7 +40,7 @@ pub fn compute_linear_idm(
         {
             use std::arch::aarch64::*;
             if count >= 4 {
-                unsafe {
+                {
                     let v_one = vdupq_n_s32(1);
                     let v_four = vdupq_n_s32(4);
                     let v_null = vdupq_n_s32(OFFSET_NULL);

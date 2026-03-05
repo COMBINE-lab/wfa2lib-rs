@@ -9,6 +9,7 @@
 
 use std::alloc::{Layout, alloc, alloc_zeroed, dealloc};
 
+use crate::arena::OffsetArena;
 use crate::offset::{OFFSET_NULL, WfOffset};
 use crate::pcigar::{PCIGAR_NULL, Pcigar};
 
@@ -41,7 +42,7 @@ pub enum WavefrontStatus {
 pub struct Wavefront {
     // Pointers first (8-byte aligned)
     /// Raw offset storage buffer.
-    offsets_ptr: *mut WfOffset,
+    pub(crate) offsets_ptr: *mut WfOffset,
     /// Backtrace pcigar values (null if no backtrace).
     bt_pcigar_ptr: *mut Pcigar,
     /// Backtrace previous-index values (null if no backtrace).
@@ -69,6 +70,8 @@ pub struct Wavefront {
     pub null: bool,
     /// Memory state of this wavefront.
     pub status: WavefrontStatus,
+    /// Whether offset array is arena-backed (skip dealloc on drop).
+    arena_backed: bool,
 }
 
 // Raw pointers are not Send/Sync by default, but our wavefronts are
@@ -78,7 +81,8 @@ unsafe impl Send for Wavefront {}
 impl Drop for Wavefront {
     fn drop(&mut self) {
         let size = self.wf_elements_allocated as usize;
-        if size > 0 && !self.offsets_ptr.is_null() {
+        // Arena-backed offsets are freed when the arena resets — skip dealloc.
+        if !self.arena_backed && size > 0 && !self.offsets_ptr.is_null() {
             unsafe {
                 let layout = Layout::array::<WfOffset>(size).unwrap();
                 dealloc(self.offsets_ptr as *mut u8, layout);
@@ -134,11 +138,52 @@ impl Wavefront {
             wf_elements_allocated,
             wf_elements_init_min: 0,
             wf_elements_init_max: 0,
+            arena_backed: false,
         }
     }
 
-    /// Resize the wavefront (content is lost).
+    /// Allocate a wavefront with offset array from the arena (bump allocator).
+    /// The offset array lives in the arena's contiguous buffer instead of
+    /// an individual heap allocation, providing O(1) allocation and spatial locality.
+    /// Backtrace arrays remain heap-allocated (only used in CIGAR mode).
+    pub fn allocate_from_arena(
+        arena: &mut OffsetArena,
+        wf_elements_allocated: i32,
+        allocate_backtrace: bool,
+    ) -> Self {
+        let size = wf_elements_allocated as usize;
+        let offsets_ptr = arena.alloc(size);
+        let (bt_pcigar_ptr, bt_prev_ptr) = if allocate_backtrace {
+            unsafe {
+                let p = alloc_zeroed(Layout::array::<Pcigar>(size).unwrap()) as *mut Pcigar;
+                let b =
+                    alloc_zeroed(Layout::array::<BtBlockIdx>(size).unwrap()) as *mut BtBlockIdx;
+                (p, b)
+            }
+        } else {
+            (std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        Self {
+            offsets_ptr,
+            bt_pcigar_ptr,
+            bt_prev_ptr,
+            null: false,
+            lo: 1,
+            hi: -1,
+            base_k: 0,
+            bt_occupancy_max: 0,
+            status: WavefrontStatus::Free,
+            wf_elements_allocated,
+            wf_elements_init_min: 0,
+            wf_elements_init_max: 0,
+            arena_backed: true,
+        }
+    }
+
+    /// Resize the wavefront (content is lost). Heap-allocated only.
+    /// Arena-backed wavefronts use `resize_from_arena` instead.
     pub fn resize(&mut self, wf_elements_allocated: i32) {
+        debug_assert!(!self.arena_backed, "use resize_from_arena for arena-backed wavefronts");
         let old_size = self.wf_elements_allocated as usize;
         let new_size = wf_elements_allocated as usize;
         self.wf_elements_allocated = wf_elements_allocated;
@@ -151,6 +196,26 @@ impl Wavefront {
             self.offsets_ptr = alloc(Layout::array::<WfOffset>(new_size).unwrap()) as *mut WfOffset;
             // Resize backtrace if present
             if !self.bt_pcigar_ptr.is_null() {
+                dealloc(self.bt_pcigar_ptr as *mut u8, Layout::array::<Pcigar>(old_size).unwrap());
+                dealloc(self.bt_prev_ptr as *mut u8, Layout::array::<BtBlockIdx>(old_size).unwrap());
+                self.bt_pcigar_ptr = alloc_zeroed(Layout::array::<Pcigar>(new_size).unwrap()) as *mut Pcigar;
+                self.bt_prev_ptr = alloc_zeroed(Layout::array::<BtBlockIdx>(new_size).unwrap()) as *mut BtBlockIdx;
+            }
+        }
+    }
+
+    /// Resize an arena-backed wavefront. Old offset region becomes dead space;
+    /// new region allocated from the arena.
+    pub fn resize_from_arena(&mut self, arena: &mut OffsetArena, wf_elements_allocated: i32) {
+        debug_assert!(self.arena_backed);
+        let old_size = self.wf_elements_allocated as usize;
+        let new_size = wf_elements_allocated as usize;
+        self.wf_elements_allocated = wf_elements_allocated;
+        // Old offset region is arena dead space (reclaimed on arena.reset())
+        self.offsets_ptr = arena.alloc(new_size);
+        // Resize backtrace if present (still heap-allocated)
+        if !self.bt_pcigar_ptr.is_null() {
+            unsafe {
                 dealloc(self.bt_pcigar_ptr as *mut u8, Layout::array::<Pcigar>(old_size).unwrap());
                 dealloc(self.bt_prev_ptr as *mut u8, Layout::array::<BtBlockIdx>(old_size).unwrap());
                 self.bt_pcigar_ptr = alloc_zeroed(Layout::array::<Pcigar>(new_size).unwrap()) as *mut Pcigar;
