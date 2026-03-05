@@ -11,7 +11,8 @@ use crate::heuristic::{self, HeuristicState, HeuristicStrategy};
 use crate::offset::{wavefront_h, wavefront_v};
 use crate::penalties::{DistanceMetric, WavefrontPenalties};
 use crate::sequences::{SequenceMode, WavefrontSequences};
-use crate::slab::{SlabMode, WAVEFRONT_IDX_NONE, WavefrontSlab};
+use crate::components::WF_PTR_NONE;
+use crate::slab::{SlabMode, WavefrontSlab};
 use crate::termination;
 use crate::wavefront::WavefrontPos;
 
@@ -53,12 +54,20 @@ pub enum AlignStatus {
 }
 
 /// Main wavefront aligner.
-pub struct WavefrontAligner {
+///
+/// The const generic `N` is the number of component slots per score:
+/// - N=1: Edit, Indel, GapLinear (only M wavefront)
+/// - N=3: GapAffine (M + I1 + D1)
+/// - N=5: GapAffine2p (M + I1 + D1 + I2 + D2)
+///
+/// Use the type aliases [`EditAligner`], [`AffineAligner`], [`Affine2pAligner`]
+/// for convenient construction.
+pub struct WavefrontAligner<const N: usize> {
     // Sequences
     pub sequences: WavefrontSequences,
 
     // Wavefront data
-    pub wf_components: WavefrontComponents,
+    pub wf_components: WavefrontComponents<N>,
     pub wavefront_slab: WavefrontSlab,
 
     // Configuration
@@ -87,15 +96,22 @@ pub struct WavefrontAligner {
     pub max_alignment_steps: i32,
 
     // BiWFA sub-aligners (lazily initialized, reused across align_biwfa calls)
-    biwfa_fwd: Option<Box<WavefrontAligner>>,
-    biwfa_rev: Option<Box<WavefrontAligner>>,
-    biwfa_base: Option<Box<WavefrontAligner>>,
+    biwfa_fwd: Option<Box<WavefrontAligner<N>>>,
+    biwfa_rev: Option<Box<WavefrontAligner<N>>>,
+    biwfa_base: Option<Box<WavefrontAligner<N>>>,
 }
 
-impl WavefrontAligner {
+/// Type alias for edit/indel/gap-linear distance (only M wavefront needed).
+pub type EditAligner = WavefrontAligner<1>;
+/// Type alias for gap-affine distance (M + I1 + D1 wavefronts).
+pub type AffineAligner = WavefrontAligner<3>;
+/// Type alias for gap-affine 2-piece distance (M + I1 + D1 + I2 + D2 wavefronts).
+pub type Affine2pAligner = WavefrontAligner<5>;
+
+impl<const N: usize> WavefrontAligner<N> {
     /// Create a new aligner with the given penalties.
     pub fn new(penalties: WavefrontPenalties) -> Self {
-        let wf_components = WavefrontComponents::new(10, 10, &penalties, false, false);
+        let wf_components = WavefrontComponents::<N>::new(10, 10, &penalties, false, false);
         let init_wf_length = 10;
 
         Self {
@@ -419,16 +435,23 @@ impl WavefrontAligner {
         // Clear slab
         self.wavefront_slab.clear();
 
-        // Pre-size slab for CIGAR mode to avoid Vec reallocations
-        if !score_only {
+        // Pre-size slab to avoid Vec reallocations that would invalidate stored *mut Wavefront ptrs.
+        // In CIGAR mode: reserve for all wavefronts across all scores.
+        // In score-only (modular) mode: reserve for the circular window (max_score_scope * num_types).
+        {
             let num_types = match self.penalties.distance_metric {
                 DistanceMetric::Edit | DistanceMetric::Indel => 1,
                 DistanceMetric::GapLinear => 1,
                 DistanceMetric::GapAffine => 3,
                 DistanceMetric::GapAffine2p => 5,
             };
-            self.wavefront_slab
-                .reserve(self.wf_components.num_wavefronts * num_types);
+            let capacity = if score_only {
+                // Modular: at most max_score_scope * num_types live wavefronts at once
+                self.wf_components.max_score_scope * num_types + num_types
+            } else {
+                self.wf_components.num_wavefronts * num_types
+            };
+            self.wavefront_slab.reserve(capacity);
         }
 
         // Reset state
@@ -455,22 +478,21 @@ impl WavefrontAligner {
         self.wf_components.resize_null_victim(eff_lo, eff_hi);
 
         // Allocate initial M-wavefront at score 0
-        let idx = self.wavefront_slab.allocate(eff_lo, eff_hi);
-        {
-            let wf = self.wavefront_slab.get_mut(idx);
-            wf.set_offset(0, 0);
-            wf.set_limits(0, 0);
+        let wf_ptr = self.wavefront_slab.allocate_ptr(eff_lo, eff_hi);
+        unsafe {
+            (*wf_ptr).set_offset(0, 0);
+            (*wf_ptr).set_limits(0, 0);
         }
-        self.wf_components.set_m_idx(0, idx);
+        self.wf_components.set_m_ptr(0, wf_ptr);
     }
 
     /// Extend the M-wavefront at the given score, check termination.
     /// Returns true if alignment is finished.
     fn extend_end2end(&mut self, score: i32) -> bool {
         let score_idx = score as usize;
-        let m_idx = self.wf_components.get_m_idx(score_idx);
+        let m_ptr = self.wf_components.get_m_ptr(score_idx);
 
-        if m_idx == WAVEFRONT_IDX_NONE {
+        if m_ptr.is_null() {
             self.num_null_steps += 1;
             if self.num_null_steps > self.wf_components.max_score_scope as i32 {
                 self.status = AlignStatus::EndUnreachable;
@@ -481,7 +503,7 @@ impl WavefrontAligner {
         self.num_null_steps = 0;
 
         // Extend matches
-        let wf = self.wavefront_slab.get_mut(m_idx);
+        let wf = unsafe { &mut *m_ptr };
         if self.sequences.mode == SequenceMode::Lambda {
             extend::extend_matches_custom_end2end(&self.sequences, wf);
         } else {
@@ -491,7 +513,7 @@ impl WavefrontAligner {
         // Check termination
         let plen = self.sequences.pattern_length;
         let tlen = self.sequences.text_length;
-        let wf = self.wavefront_slab.get(m_idx);
+        let wf = unsafe { &*m_ptr };
         if termination::termination_end2end(plen, tlen, wf) {
             let alignment_k = tlen - plen;
             self.alignment_end_pos = WavefrontPos {
@@ -505,7 +527,7 @@ impl WavefrontAligner {
 
         // Apply heuristic cutoff
         if !matches!(self.heuristic, HeuristicStrategy::None)
-            && self.apply_heuristic_cutoff(score, m_idx)
+            && self.apply_heuristic_cutoff(score, m_ptr)
         {
             self.status = AlignStatus::EndUnreachable;
             return true;
@@ -518,9 +540,9 @@ impl WavefrontAligner {
     /// Returns true if alignment is finished.
     fn extend_endsfree(&mut self, score: i32) -> bool {
         let score_idx = score as usize;
-        let m_idx = self.wf_components.get_m_idx(score_idx);
+        let m_ptr = self.wf_components.get_m_ptr(score_idx);
 
-        if m_idx == WAVEFRONT_IDX_NONE {
+        if m_ptr.is_null() {
             self.num_null_steps += 1;
             if self.num_null_steps > self.wf_components.max_score_scope as i32 {
                 self.status = AlignStatus::EndUnreachable;
@@ -531,7 +553,7 @@ impl WavefrontAligner {
         self.num_null_steps = 0;
 
         // Extend matches with ends-free termination check
-        let wf = self.wavefront_slab.get_mut(m_idx);
+        let wf = unsafe { &mut *m_ptr };
         let result = if self.sequences.mode == SequenceMode::Lambda {
             extend::extend_matches_custom_endsfree(
                 &self.sequences,
@@ -556,7 +578,7 @@ impl WavefrontAligner {
 
         // Apply heuristic cutoff
         if !matches!(self.heuristic, HeuristicStrategy::None)
-            && self.apply_heuristic_cutoff(score, m_idx)
+            && self.apply_heuristic_cutoff(score, m_ptr)
         {
             self.status = AlignStatus::EndUnreachable;
             return true;
@@ -587,7 +609,7 @@ impl WavefrontAligner {
 
     /// Apply heuristic cutoff to the M-wavefront (and I/D wavefronts if affine).
     /// Returns true if alignment should be terminated (z-drop).
-    fn apply_heuristic_cutoff(&mut self, score: i32, m_idx: usize) -> bool {
+    fn apply_heuristic_cutoff(&mut self, score: i32, m_ptr: *mut crate::wavefront::Wavefront) -> bool {
         let plen = self.sequences.pattern_length;
         let tlen = self.sequences.text_length;
 
@@ -595,7 +617,7 @@ impl WavefrontAligner {
         let distances_base_k = self.wf_components.wavefront_victim.base_k();
         let distances = self.wf_components.wavefront_victim.offsets_slice_mut();
 
-        let wf = self.wavefront_slab.get_mut(m_idx);
+        let wf = unsafe { &mut *m_ptr };
         let zdropped = heuristic::heuristic_cutoff(
             &self.heuristic,
             &mut self.heuristic_state,
@@ -615,60 +637,41 @@ impl WavefrontAligner {
         let score_idx = score as usize;
         match self.penalties.distance_metric {
             DistanceMetric::GapAffine => {
-                let m_wf = self.wavefront_slab.get(m_idx);
-                let m_lo = m_wf.lo;
-                let m_hi = m_wf.hi;
+                let (m_lo, m_hi) = unsafe { ((*m_ptr).lo, (*m_ptr).hi) };
 
-                let i1_idx = self.wf_components.get_i1_idx(score_idx);
-                if i1_idx != WAVEFRONT_IDX_NONE {
-                    let i1_wf = self.wavefront_slab.get_mut(i1_idx);
-                    if m_lo > i1_wf.lo {
-                        i1_wf.lo = m_lo;
-                    }
-                    if m_hi < i1_wf.hi {
-                        i1_wf.hi = m_hi;
-                    }
-                    if i1_wf.lo > i1_wf.hi {
-                        i1_wf.null = true;
+                let i1_ptr = self.wf_components.get_i1_ptr(score_idx);
+                if !i1_ptr.is_null() {
+                    unsafe {
+                        if m_lo > (*i1_ptr).lo { (*i1_ptr).lo = m_lo; }
+                        if m_hi < (*i1_ptr).hi { (*i1_ptr).hi = m_hi; }
+                        if (*i1_ptr).lo > (*i1_ptr).hi { (*i1_ptr).null = true; }
                     }
                 }
 
-                let d1_idx = self.wf_components.get_d1_idx(score_idx);
-                if d1_idx != WAVEFRONT_IDX_NONE {
-                    let d1_wf = self.wavefront_slab.get_mut(d1_idx);
-                    if m_lo > d1_wf.lo {
-                        d1_wf.lo = m_lo;
-                    }
-                    if m_hi < d1_wf.hi {
-                        d1_wf.hi = m_hi;
-                    }
-                    if d1_wf.lo > d1_wf.hi {
-                        d1_wf.null = true;
+                let d1_ptr = self.wf_components.get_d1_ptr(score_idx);
+                if !d1_ptr.is_null() {
+                    unsafe {
+                        if m_lo > (*d1_ptr).lo { (*d1_ptr).lo = m_lo; }
+                        if m_hi < (*d1_ptr).hi { (*d1_ptr).hi = m_hi; }
+                        if (*d1_ptr).lo > (*d1_ptr).hi { (*d1_ptr).null = true; }
                     }
                 }
             }
             DistanceMetric::GapAffine2p => {
-                let m_wf = self.wavefront_slab.get(m_idx);
-                let m_lo = m_wf.lo;
-                let m_hi = m_wf.hi;
+                let (m_lo, m_hi) = unsafe { ((*m_ptr).lo, (*m_ptr).hi) };
 
-                for get_idx_fn in [
-                    WavefrontComponents::get_i1_idx,
-                    WavefrontComponents::get_d1_idx,
-                    WavefrontComponents::get_i2_idx,
-                    WavefrontComponents::get_d2_idx,
+                for get_ptr_fn in [
+                    WavefrontComponents::get_i1_ptr,
+                    WavefrontComponents::get_d1_ptr,
+                    WavefrontComponents::get_i2_ptr,
+                    WavefrontComponents::get_d2_ptr,
                 ] {
-                    let idx = get_idx_fn(&self.wf_components, score_idx);
-                    if idx != WAVEFRONT_IDX_NONE {
-                        let wf = self.wavefront_slab.get_mut(idx);
-                        if m_lo > wf.lo {
-                            wf.lo = m_lo;
-                        }
-                        if m_hi < wf.hi {
-                            wf.hi = m_hi;
-                        }
-                        if wf.lo > wf.hi {
-                            wf.null = true;
+                    let ptr = get_ptr_fn(&self.wf_components, score_idx);
+                    if !ptr.is_null() {
+                        unsafe {
+                            if m_lo > (*ptr).lo { (*ptr).lo = m_lo; }
+                            if m_hi < (*ptr).hi { (*ptr).hi = m_hi; }
+                            if (*ptr).lo > (*ptr).hi { (*ptr).null = true; }
                         }
                     }
                 }
@@ -684,12 +687,9 @@ impl WavefrontAligner {
         let score_prev = (score - 1) as usize;
         let score_curr = score as usize;
 
-        let prev_idx = self.wf_components.get_m_idx(score_prev);
+        let prev_ptr = self.wf_components.get_m_ptr(score_prev);
         // Get prev wavefront dimensions
-        let (prev_lo, prev_hi) = {
-            let wf = self.wavefront_slab.get(prev_idx);
-            (wf.lo, wf.hi)
-        };
+        let (prev_lo, prev_hi) = unsafe { ((*prev_ptr).lo, (*prev_ptr).hi) };
 
         let lo = prev_lo - 1;
         let hi = prev_hi + 1;
@@ -697,48 +697,43 @@ impl WavefrontAligner {
         // Initialize ends on previous wavefront (like C's wavefront_compute_init_ends)
         // Edit kernel reads prev[k-1], prev[k], prev[k+1] for k in [lo, hi]
         // so prev needs [lo-1, hi+1]
-        {
-            let wf_prev = self.wavefront_slab.get_mut(prev_idx);
-            wf_prev.init_ends_higher(hi + 1);
-            wf_prev.init_ends_lower(lo - 1);
+        unsafe {
+            (*prev_ptr).init_ends_higher(hi + 1);
+            (*prev_ptr).init_ends_lower(lo - 1);
         }
 
         // Allocate or reuse output wavefront
         let hist_lo = self.wf_components.historic_min_lo;
         let hist_hi = self.wf_components.historic_max_hi;
-        let curr_idx = if self.wf_components.memory_modular {
-            let old_idx = self.wf_components.get_m_idx(score_curr);
-            self.wavefront_slab.reuse_or_allocate(old_idx, hist_lo, hist_hi)
+        let curr_ptr = if self.wf_components.memory_modular {
+            let old_ptr = self.wf_components.get_m_ptr(score_curr);
+            self.wavefront_slab.reuse_or_allocate_ptr(old_ptr, hist_lo, hist_hi)
         } else {
-            self.wavefront_slab.allocate(hist_lo, hist_hi)
+            self.wavefront_slab.allocate_ptr(hist_lo, hist_hi)
         };
-        {
-            let wf_curr = self.wavefront_slab.get_mut(curr_idx);
-            wf_curr.set_limits(lo, hi);
-        }
+        unsafe { (*curr_ptr).set_limits(lo, hi); }
 
         // Compute kernel
         let plen = self.sequences.pattern_length;
         let tlen = self.sequences.text_length;
-        {
-            let (wf_prev, wf_curr) = self.wavefront_slab.get_two_mut(prev_idx, curr_idx);
+        unsafe {
             match self.penalties.distance_metric {
                 DistanceMetric::Edit => {
-                    edit::compute_edit_idm(plen, tlen, wf_prev, wf_curr, lo, hi);
+                    edit::compute_edit_idm(plen, tlen, &*prev_ptr, &mut *curr_ptr, lo, hi);
                 }
                 DistanceMetric::Indel => {
-                    edit::compute_indel_idm(plen, tlen, wf_prev, wf_curr, lo, hi);
+                    edit::compute_indel_idm(plen, tlen, &*prev_ptr, &mut *curr_ptr, lo, hi);
                 }
                 _ => unreachable!("compute_edit_step called for non-edit metric"),
             }
         }
 
         // Store in components
-        self.wf_components.set_m_idx(score_curr, curr_idx);
+        self.wf_components.set_m_ptr(score_curr, curr_ptr);
 
         // Trim ends
         {
-            let wf_curr = self.wavefront_slab.get_mut(curr_idx);
+            let wf_curr = unsafe { &mut *curr_ptr };
             compute::trim_ends(plen, tlen, wf_curr);
             if wf_curr.null {
                 self.num_null_steps = i32::MAX;
@@ -755,27 +750,25 @@ impl WavefrontAligner {
         let misms_score = score - self.penalties.mismatch;
         let gap_score = score - self.penalties.gap_opening1;
 
-        let misms_idx = if misms_score >= 0 {
-            self.wf_components.get_m_idx(misms_score as usize)
+        let misms_ptr = if misms_score >= 0 {
+            self.wf_components.get_m_ptr(misms_score as usize)
         } else {
-            WAVEFRONT_IDX_NONE
+            WF_PTR_NONE
         };
-        let gap_idx = if gap_score >= 0 {
-            self.wf_components.get_m_idx(gap_score as usize)
+        let gap_ptr = if gap_score >= 0 {
+            self.wf_components.get_m_ptr(gap_score as usize)
         } else {
-            WAVEFRONT_IDX_NONE
+            WF_PTR_NONE
         };
 
         // Get effective lo/hi from input wavefronts
-        let (misms_lo, misms_hi) = if misms_idx != WAVEFRONT_IDX_NONE {
-            let wf = self.wavefront_slab.get(misms_idx);
-            (wf.lo, wf.hi)
+        let (misms_lo, misms_hi) = if !misms_ptr.is_null() {
+            unsafe { ((*misms_ptr).lo, (*misms_ptr).hi) }
         } else {
             (0, -1) // empty range
         };
-        let (gap_lo, gap_hi) = if gap_idx != WAVEFRONT_IDX_NONE {
-            let wf = self.wavefront_slab.get(gap_idx);
-            (wf.lo, wf.hi)
+        let (gap_lo, gap_hi) = if !gap_ptr.is_null() {
+            unsafe { ((*gap_ptr).lo, (*gap_ptr).hi) }
         } else {
             (0, -1) // empty range
         };
@@ -794,54 +787,43 @@ impl WavefrontAligner {
 
         // Initialize input wavefront ends (like C's wavefront_compute_init_ends)
         // misms needs [lo, hi]
-        if misms_idx != WAVEFRONT_IDX_NONE {
-            let wf = self.wavefront_slab.get_mut(misms_idx);
-            wf.init_ends_higher(hi);
-            wf.init_ends_lower(lo);
+        if !misms_ptr.is_null() {
+            unsafe {
+                (*misms_ptr).init_ends_higher(hi);
+                (*misms_ptr).init_ends_lower(lo);
+            }
         }
         // gap needs [lo-1, hi+1] (kernel reads k-1 and k+1)
-        if gap_idx != WAVEFRONT_IDX_NONE {
-            let wf = self.wavefront_slab.get_mut(gap_idx);
-            wf.init_ends_higher(hi + 1);
-            wf.init_ends_lower(lo - 1);
+        if !gap_ptr.is_null() {
+            unsafe {
+                (*gap_ptr).init_ends_higher(hi + 1);
+                (*gap_ptr).init_ends_lower(lo - 1);
+            }
         }
-        let use_misms_idx = misms_idx;
 
         // Allocate or reuse output wavefront
         let hist_lo = self.wf_components.historic_min_lo;
         let hist_hi = self.wf_components.historic_max_hi;
-        let curr_idx = if self.wf_components.memory_modular {
-            let old_idx = self.wf_components.get_m_idx(score_curr);
-            self.wavefront_slab.reuse_or_allocate(old_idx, hist_lo, hist_hi)
+        let curr_ptr = if self.wf_components.memory_modular {
+            let old_ptr = self.wf_components.get_m_ptr(score_curr);
+            self.wavefront_slab.reuse_or_allocate_ptr(old_ptr, hist_lo, hist_hi)
         } else {
-            self.wavefront_slab.allocate(hist_lo, hist_hi)
+            self.wavefront_slab.allocate_ptr(hist_lo, hist_hi)
         };
-        {
-            let wf_curr = self.wavefront_slab.get_mut(curr_idx);
-            wf_curr.set_limits(lo, hi);
-        }
+        unsafe { (*curr_ptr).set_limits(lo, hi); }
 
         // Compute kernel using raw pointers for multi-borrow
         unsafe {
             let null_wf = &self.wf_components.wavefront_null as *const _;
 
-            let wf_misms_ptr = if use_misms_idx != WAVEFRONT_IDX_NONE {
-                self.wavefront_slab.get(use_misms_idx) as *const _
-            } else {
-                null_wf
-            };
-            let wf_gap_ptr = if gap_idx != WAVEFRONT_IDX_NONE {
-                self.wavefront_slab.get(gap_idx) as *const _
-            } else {
-                null_wf
-            };
-            let curr_ptr = self.wavefront_slab.get_raw_mut(curr_idx);
+            let wf_misms_cptr = if !misms_ptr.is_null() { misms_ptr as *const _ } else { null_wf };
+            let wf_gap_cptr = if !gap_ptr.is_null() { gap_ptr as *const _ } else { null_wf };
 
             linear::compute_linear_idm(
                 plen,
                 tlen,
-                &*wf_misms_ptr,
-                &*wf_gap_ptr,
+                &*wf_misms_cptr,
+                &*wf_gap_cptr,
                 &mut *curr_ptr,
                 lo,
                 hi,
@@ -849,11 +831,11 @@ impl WavefrontAligner {
         }
 
         // Store in components
-        self.wf_components.set_m_idx(score_curr, curr_idx);
+        self.wf_components.set_m_ptr(score_curr, curr_ptr);
 
         // Trim ends
         {
-            let wf_curr = self.wavefront_slab.get_mut(curr_idx);
+            let wf_curr = unsafe { &mut *curr_ptr };
             compute::trim_ends(plen, tlen, wf_curr);
             if wf_curr.null {
                 self.num_null_steps = i32::MAX;
@@ -871,58 +853,15 @@ impl WavefrontAligner {
         let o_plus_e = self.penalties.gap_opening1 + self.penalties.gap_extension1;
         let e = self.penalties.gap_extension1;
 
-        // Fetch input wavefront indices
-        let m_misms_score = score - x;
-        let m_open_score = score - o_plus_e;
-        let i1_ext_score = score - e;
-        let d1_ext_score = score - e;
-
-        let m_misms_idx = if m_misms_score >= 0 {
-            self.wf_components.get_m_idx(m_misms_score as usize)
-        } else {
-            WAVEFRONT_IDX_NONE
-        };
-        let m_open_idx = if m_open_score >= 0 {
-            self.wf_components.get_m_idx(m_open_score as usize)
-        } else {
-            WAVEFRONT_IDX_NONE
-        };
-        let i1_ext_idx = if i1_ext_score >= 0 {
-            self.wf_components.get_i1_idx(i1_ext_score as usize)
-        } else {
-            WAVEFRONT_IDX_NONE
-        };
-        let d1_ext_idx = if d1_ext_score >= 0 {
-            self.wf_components.get_d1_idx(d1_ext_score as usize)
-        } else {
-            WAVEFRONT_IDX_NONE
-        };
-
-        // Cache raw pointers to input wavefronts once; reuse for lo/hi, init_ends, and kernel.
+        // Fetch input wavefront pointers directly from flat array.
         // SAFETY: slab.wavefronts is pre-reserved (no reallocation during this step),
         // and resize_null_victim only modifies WavefrontComponents inline fields (not the slab).
-        let ptr_m_misms = if m_misms_idx != WAVEFRONT_IDX_NONE {
-            unsafe { self.wavefront_slab.get_raw_mut(m_misms_idx) }
-        } else {
-            std::ptr::null_mut()
-        };
-        let ptr_m_open = if m_open_idx != WAVEFRONT_IDX_NONE {
-            unsafe { self.wavefront_slab.get_raw_mut(m_open_idx) }
-        } else {
-            std::ptr::null_mut()
-        };
-        let ptr_i1_ext = if i1_ext_idx != WAVEFRONT_IDX_NONE {
-            unsafe { self.wavefront_slab.get_raw_mut(i1_ext_idx) }
-        } else {
-            std::ptr::null_mut()
-        };
-        let ptr_d1_ext = if d1_ext_idx != WAVEFRONT_IDX_NONE {
-            unsafe { self.wavefront_slab.get_raw_mut(d1_ext_idx) }
-        } else {
-            std::ptr::null_mut()
-        };
+        let ptr_m_misms = if score - x >= 0 { self.wf_components.get_m_ptr((score - x) as usize) } else { WF_PTR_NONE };
+        let ptr_m_open  = if score - o_plus_e >= 0 { self.wf_components.get_m_ptr((score - o_plus_e) as usize) } else { WF_PTR_NONE };
+        let ptr_i1_ext  = if score - e >= 0 { self.wf_components.get_i1_ptr((score - e) as usize) } else { WF_PTR_NONE };
+        let ptr_d1_ext  = if score - e >= 0 { self.wf_components.get_d1_ptr((score - e) as usize) } else { WF_PTR_NONE };
 
-        // Compute effective lo/hi from cached pointers (no slab re-lookup)
+        // Compute effective lo/hi from pointers (no slab re-lookup)
         let mut lo = i32::MAX;
         let mut hi = i32::MIN;
         unsafe {
@@ -956,7 +895,7 @@ impl WavefrontAligner {
         // Ensure null/victim wavefronts cover the range
         self.wf_components.resize_null_victim(lo, hi);
 
-        // Initialize input wavefront ends using cached raw pointers (no slab re-lookup)
+        // Initialize input wavefront ends using pointers (no slab re-lookup)
         unsafe {
             if !ptr_m_misms.is_null() { (*ptr_m_misms).init_ends_higher(hi);     (*ptr_m_misms).init_ends_lower(lo);     }
             if !ptr_m_open.is_null()  { (*ptr_m_open).init_ends_higher(hi + 1);  (*ptr_m_open).init_ends_lower(lo - 1);  }
@@ -965,35 +904,31 @@ impl WavefrontAligner {
         }
 
         // Allocate or reuse 3 output wavefronts
-        let (m_curr_idx, i1_curr_idx, d1_curr_idx) = if self.wf_components.memory_modular {
-            let old_m = self.wf_components.get_m_idx(score_curr);
-            let old_i1 = self.wf_components.get_i1_idx(score_curr);
-            let old_d1 = self.wf_components.get_d1_idx(score_curr);
+        let (m_curr_ptr, i1_curr_ptr, d1_curr_ptr) = if self.wf_components.memory_modular {
+            let old_m  = self.wf_components.get_m_ptr(score_curr);
+            let old_i1 = self.wf_components.get_i1_ptr(score_curr);
+            let old_d1 = self.wf_components.get_d1_ptr(score_curr);
             (
-                self.wavefront_slab.reuse_or_allocate(old_m, hist_lo, hist_hi),
-                self.wavefront_slab.reuse_or_allocate(old_i1, hist_lo, hist_hi),
-                self.wavefront_slab.reuse_or_allocate(old_d1, hist_lo, hist_hi),
+                self.wavefront_slab.reuse_or_allocate_ptr(old_m,  hist_lo, hist_hi),
+                self.wavefront_slab.reuse_or_allocate_ptr(old_i1, hist_lo, hist_hi),
+                self.wavefront_slab.reuse_or_allocate_ptr(old_d1, hist_lo, hist_hi),
             )
         } else {
             (
-                self.wavefront_slab.allocate(hist_lo, hist_hi),
-                self.wavefront_slab.allocate(hist_lo, hist_hi),
-                self.wavefront_slab.allocate(hist_lo, hist_hi),
+                self.wavefront_slab.allocate_ptr(hist_lo, hist_hi),
+                self.wavefront_slab.allocate_ptr(hist_lo, hist_hi),
+                self.wavefront_slab.allocate_ptr(hist_lo, hist_hi),
             )
         };
 
         // Compute kernel using raw pointers for multi-borrow
-        // Input ptrs reuse cached pointers (no extra slab lookups); outputs are fresh.
+        // Input ptrs come directly from flat[] (no extra slab lookups); outputs are fresh.
         unsafe {
             let null_wf = &self.wf_components.wavefront_null as *const _;
             let wf_m_misms = if !ptr_m_misms.is_null() { ptr_m_misms as *const _ } else { null_wf };
             let wf_m_open  = if !ptr_m_open.is_null()  { ptr_m_open  as *const _ } else { null_wf };
             let wf_i1_ext  = if !ptr_i1_ext.is_null()  { ptr_i1_ext  as *const _ } else { null_wf };
             let wf_d1_ext  = if !ptr_d1_ext.is_null()  { ptr_d1_ext  as *const _ } else { null_wf };
-
-            let m_curr_ptr = self.wavefront_slab.get_raw_mut(m_curr_idx);
-            let i1_curr_ptr = self.wavefront_slab.get_raw_mut(i1_curr_idx);
-            let d1_curr_ptr = self.wavefront_slab.get_raw_mut(d1_curr_idx);
 
             // set_limits on output wavefronts via their raw ptrs (avoids 3 more slab lookups)
             (*m_curr_ptr).set_limits(lo, hi);
@@ -1016,16 +951,16 @@ impl WavefrontAligner {
         }
 
         // Store in components
-        self.wf_components.set_m_idx(score_curr, m_curr_idx);
-        self.wf_components.set_i1_idx(score_curr, i1_curr_idx);
-        self.wf_components.set_d1_idx(score_curr, d1_curr_idx);
+        self.wf_components.set_m_ptr(score_curr, m_curr_ptr);
+        self.wf_components.set_i1_ptr(score_curr, i1_curr_ptr);
+        self.wf_components.set_d1_ptr(score_curr, d1_curr_ptr);
 
         // Trim ends on M wavefront to detect null steps.
         // I1/D1 don't need trimming: the NEON/scalar kernel already clamps
         // out-of-bounds M offsets to OFFSET_NULL. I1/D1 values are only read
         // at k±1 (within allocated range) and never used for termination.
         {
-            let wf_curr = self.wavefront_slab.get_mut(m_curr_idx);
+            let wf_curr = unsafe { &mut *m_curr_ptr };
             compute::trim_ends(plen, tlen, wf_curr);
             if wf_curr.null {
                 self.num_null_steps = i32::MAX;
@@ -1045,54 +980,17 @@ impl WavefrontAligner {
         let o2_plus_e2 = self.penalties.gap_opening2 + self.penalties.gap_extension2;
         let e2 = self.penalties.gap_extension2;
 
-        // Fetch input wavefront indices
-        let m_misms_idx = if score - x >= 0 {
-            self.wf_components.get_m_idx((score - x) as usize)
-        } else {
-            WAVEFRONT_IDX_NONE
-        };
-        let m_open1_idx = if score - o1_plus_e1 >= 0 {
-            self.wf_components.get_m_idx((score - o1_plus_e1) as usize)
-        } else {
-            WAVEFRONT_IDX_NONE
-        };
-        let m_open2_idx = if score - o2_plus_e2 >= 0 {
-            self.wf_components.get_m_idx((score - o2_plus_e2) as usize)
-        } else {
-            WAVEFRONT_IDX_NONE
-        };
-        let i1_ext_idx = if score - e1 >= 0 {
-            self.wf_components.get_i1_idx((score - e1) as usize)
-        } else {
-            WAVEFRONT_IDX_NONE
-        };
-        let i2_ext_idx = if score - e2 >= 0 {
-            self.wf_components.get_i2_idx((score - e2) as usize)
-        } else {
-            WAVEFRONT_IDX_NONE
-        };
-        let d1_ext_idx = if score - e1 >= 0 {
-            self.wf_components.get_d1_idx((score - e1) as usize)
-        } else {
-            WAVEFRONT_IDX_NONE
-        };
-        let d2_ext_idx = if score - e2 >= 0 {
-            self.wf_components.get_d2_idx((score - e2) as usize)
-        } else {
-            WAVEFRONT_IDX_NONE
-        };
-
-        // Cache raw pointers to all 7 input wavefronts once; reuse for lo/hi, init_ends, and kernel.
+        // Fetch input wavefront pointers directly from flat array.
         // SAFETY: slab.wavefronts is pre-reserved; resize_null_victim does not touch the slab.
-        let ptr_m_misms = if m_misms_idx != WAVEFRONT_IDX_NONE { unsafe { self.wavefront_slab.get_raw_mut(m_misms_idx) } } else { std::ptr::null_mut() };
-        let ptr_m_open1 = if m_open1_idx != WAVEFRONT_IDX_NONE { unsafe { self.wavefront_slab.get_raw_mut(m_open1_idx) } } else { std::ptr::null_mut() };
-        let ptr_m_open2 = if m_open2_idx != WAVEFRONT_IDX_NONE { unsafe { self.wavefront_slab.get_raw_mut(m_open2_idx) } } else { std::ptr::null_mut() };
-        let ptr_i1_ext  = if i1_ext_idx  != WAVEFRONT_IDX_NONE { unsafe { self.wavefront_slab.get_raw_mut(i1_ext_idx)  } } else { std::ptr::null_mut() };
-        let ptr_i2_ext  = if i2_ext_idx  != WAVEFRONT_IDX_NONE { unsafe { self.wavefront_slab.get_raw_mut(i2_ext_idx)  } } else { std::ptr::null_mut() };
-        let ptr_d1_ext  = if d1_ext_idx  != WAVEFRONT_IDX_NONE { unsafe { self.wavefront_slab.get_raw_mut(d1_ext_idx)  } } else { std::ptr::null_mut() };
-        let ptr_d2_ext  = if d2_ext_idx  != WAVEFRONT_IDX_NONE { unsafe { self.wavefront_slab.get_raw_mut(d2_ext_idx)  } } else { std::ptr::null_mut() };
+        let ptr_m_misms = if score - x >= 0 { self.wf_components.get_m_ptr((score - x) as usize) } else { WF_PTR_NONE };
+        let ptr_m_open1 = if score - o1_plus_e1 >= 0 { self.wf_components.get_m_ptr((score - o1_plus_e1) as usize) } else { WF_PTR_NONE };
+        let ptr_m_open2 = if score - o2_plus_e2 >= 0 { self.wf_components.get_m_ptr((score - o2_plus_e2) as usize) } else { WF_PTR_NONE };
+        let ptr_i1_ext  = if score - e1 >= 0 { self.wf_components.get_i1_ptr((score - e1) as usize) } else { WF_PTR_NONE };
+        let ptr_i2_ext  = if score - e2 >= 0 { self.wf_components.get_i2_ptr((score - e2) as usize) } else { WF_PTR_NONE };
+        let ptr_d1_ext  = if score - e1 >= 0 { self.wf_components.get_d1_ptr((score - e1) as usize) } else { WF_PTR_NONE };
+        let ptr_d2_ext  = if score - e2 >= 0 { self.wf_components.get_d2_ptr((score - e2) as usize) } else { WF_PTR_NONE };
 
-        // Compute effective lo/hi from cached pointers (no slab re-lookup)
+        // Compute effective lo/hi from pointers (no slab re-lookup)
         let mut lo = i32::MAX;
         let mut hi = i32::MIN;
         unsafe {
@@ -1128,7 +1026,7 @@ impl WavefrontAligner {
         // Ensure null/victim wavefronts cover the range
         self.wf_components.resize_null_victim(lo, hi);
 
-        // Initialize input wavefront ends using cached raw pointers (no slab re-lookup)
+        // Initialize input wavefront ends using pointers (no slab re-lookup)
         unsafe {
             if !ptr_m_misms.is_null() { (*ptr_m_misms).init_ends_higher(hi);     (*ptr_m_misms).init_ends_lower(lo);     }
             if !ptr_m_open1.is_null() { (*ptr_m_open1).init_ends_higher(hi + 1); (*ptr_m_open1).init_ends_lower(lo - 1); }
@@ -1140,32 +1038,32 @@ impl WavefrontAligner {
         }
 
         // Allocate or reuse 5 output wavefronts
-        let (m_curr_idx, i1_curr_idx, i2_curr_idx, d1_curr_idx, d2_curr_idx) =
+        let (m_curr_ptr, i1_curr_ptr, i2_curr_ptr, d1_curr_ptr, d2_curr_ptr) =
             if self.wf_components.memory_modular {
-                let old_m = self.wf_components.get_m_idx(score_curr);
-                let old_i1 = self.wf_components.get_i1_idx(score_curr);
-                let old_i2 = self.wf_components.get_i2_idx(score_curr);
-                let old_d1 = self.wf_components.get_d1_idx(score_curr);
-                let old_d2 = self.wf_components.get_d2_idx(score_curr);
+                let old_m  = self.wf_components.get_m_ptr(score_curr);
+                let old_i1 = self.wf_components.get_i1_ptr(score_curr);
+                let old_i2 = self.wf_components.get_i2_ptr(score_curr);
+                let old_d1 = self.wf_components.get_d1_ptr(score_curr);
+                let old_d2 = self.wf_components.get_d2_ptr(score_curr);
                 (
-                    self.wavefront_slab.reuse_or_allocate(old_m, hist_lo, hist_hi),
-                    self.wavefront_slab.reuse_or_allocate(old_i1, hist_lo, hist_hi),
-                    self.wavefront_slab.reuse_or_allocate(old_i2, hist_lo, hist_hi),
-                    self.wavefront_slab.reuse_or_allocate(old_d1, hist_lo, hist_hi),
-                    self.wavefront_slab.reuse_or_allocate(old_d2, hist_lo, hist_hi),
+                    self.wavefront_slab.reuse_or_allocate_ptr(old_m,  hist_lo, hist_hi),
+                    self.wavefront_slab.reuse_or_allocate_ptr(old_i1, hist_lo, hist_hi),
+                    self.wavefront_slab.reuse_or_allocate_ptr(old_i2, hist_lo, hist_hi),
+                    self.wavefront_slab.reuse_or_allocate_ptr(old_d1, hist_lo, hist_hi),
+                    self.wavefront_slab.reuse_or_allocate_ptr(old_d2, hist_lo, hist_hi),
                 )
             } else {
                 (
-                    self.wavefront_slab.allocate(hist_lo, hist_hi),
-                    self.wavefront_slab.allocate(hist_lo, hist_hi),
-                    self.wavefront_slab.allocate(hist_lo, hist_hi),
-                    self.wavefront_slab.allocate(hist_lo, hist_hi),
-                    self.wavefront_slab.allocate(hist_lo, hist_hi),
+                    self.wavefront_slab.allocate_ptr(hist_lo, hist_hi),
+                    self.wavefront_slab.allocate_ptr(hist_lo, hist_hi),
+                    self.wavefront_slab.allocate_ptr(hist_lo, hist_hi),
+                    self.wavefront_slab.allocate_ptr(hist_lo, hist_hi),
+                    self.wavefront_slab.allocate_ptr(hist_lo, hist_hi),
                 )
             };
 
         // Compute kernel using raw pointers for multi-borrow
-        // Input ptrs reuse cached pointers (no extra slab lookups); outputs are fresh.
+        // Input ptrs come directly from flat[] (no extra slab lookups); outputs are fresh.
         unsafe {
             let null_wf = &self.wf_components.wavefront_null as *const _;
             let wf_m_misms = if !ptr_m_misms.is_null() { ptr_m_misms as *const _ } else { null_wf };
@@ -1175,12 +1073,6 @@ impl WavefrontAligner {
             let wf_i2_ext  = if !ptr_i2_ext.is_null()  { ptr_i2_ext  as *const _ } else { null_wf };
             let wf_d1_ext  = if !ptr_d1_ext.is_null()  { ptr_d1_ext  as *const _ } else { null_wf };
             let wf_d2_ext  = if !ptr_d2_ext.is_null()  { ptr_d2_ext  as *const _ } else { null_wf };
-
-            let m_curr_ptr = self.wavefront_slab.get_raw_mut(m_curr_idx);
-            let i1_curr_ptr = self.wavefront_slab.get_raw_mut(i1_curr_idx);
-            let i2_curr_ptr = self.wavefront_slab.get_raw_mut(i2_curr_idx);
-            let d1_curr_ptr = self.wavefront_slab.get_raw_mut(d1_curr_idx);
-            let d2_curr_ptr = self.wavefront_slab.get_raw_mut(d2_curr_idx);
 
             // set_limits on output wavefronts via raw ptrs (avoids 5 more slab lookups)
             (*m_curr_ptr).set_limits(lo, hi);
@@ -1210,15 +1102,15 @@ impl WavefrontAligner {
         }
 
         // Store in components
-        self.wf_components.set_m_idx(score_curr, m_curr_idx);
-        self.wf_components.set_i1_idx(score_curr, i1_curr_idx);
-        self.wf_components.set_i2_idx(score_curr, i2_curr_idx);
-        self.wf_components.set_d1_idx(score_curr, d1_curr_idx);
-        self.wf_components.set_d2_idx(score_curr, d2_curr_idx);
+        self.wf_components.set_m_ptr(score_curr, m_curr_ptr);
+        self.wf_components.set_i1_ptr(score_curr, i1_curr_ptr);
+        self.wf_components.set_i2_ptr(score_curr, i2_curr_ptr);
+        self.wf_components.set_d1_ptr(score_curr, d1_curr_ptr);
+        self.wf_components.set_d2_ptr(score_curr, d2_curr_ptr);
 
         // Trim ends on M wavefront only
         {
-            let wf_curr = self.wavefront_slab.get_mut(m_curr_idx);
+            let wf_curr = unsafe { &mut *m_curr_ptr };
             compute::trim_ends(plen, tlen, wf_curr);
             if wf_curr.null {
                 self.num_null_steps = i32::MAX;
@@ -1250,7 +1142,7 @@ impl WavefrontAligner {
         if self.biwfa_fwd.is_none() {
             self.biwfa_fwd = Some(Box::new(Self::new_biwfa_sub(self.penalties.clone())));
             self.biwfa_rev = Some(Box::new(Self::new_biwfa_sub(self.penalties.clone())));
-            let mut b = WavefrontAligner::new(self.penalties.clone());
+            let mut b = WavefrontAligner::<N>::new(self.penalties.clone());
             b.alignment_scope = AlignmentScope::ComputeAlignment;
             self.biwfa_base = Some(Box::new(b));
         }
@@ -1318,7 +1210,7 @@ impl WavefrontAligner {
 
     /// Create a sub-aligner for BiWFA with modular wavefront storage (score-only).
     fn new_biwfa_sub(penalties: WavefrontPenalties) -> Self {
-        let wf_components = WavefrontComponents::new(10, 10, &penalties, true, false);
+        let wf_components = WavefrontComponents::<N>::new(10, 10, &penalties, true, false);
         Self {
             sequences: WavefrontSequences::new(),
             wf_components,
@@ -1350,9 +1242,9 @@ impl WavefrontAligner {
         cigar: &mut Cigar,
         penalties: &WavefrontPenalties,
         max_steps: i32,
-        fwd: &mut WavefrontAligner,
-        rev: &mut WavefrontAligner,
-        base: &mut WavefrontAligner,
+        fwd: &mut WavefrontAligner<N>,
+        rev: &mut WavefrontAligner<N>,
+        base: &mut WavefrontAligner<N>,
         pattern: &[u8],
         text: &[u8],
         pb: i32,
@@ -1484,8 +1376,8 @@ impl WavefrontAligner {
     fn bialign_find_breakpoint(
         penalties: &WavefrontPenalties,
         max_steps: i32,
-        fwd: &mut WavefrontAligner,
-        rev: &mut WavefrontAligner,
+        fwd: &mut WavefrontAligner<N>,
+        rev: &mut WavefrontAligner<N>,
         pattern: &[u8],
         text: &[u8],
         component_begin: ComponentType,
@@ -1634,7 +1526,7 @@ impl WavefrontAligner {
     fn bialign_base(
         cigar: &mut Cigar,
         penalties: &WavefrontPenalties,
-        base: &mut WavefrontAligner,
+        base: &mut WavefrontAligner<N>,
         pattern: &[u8],
         text: &[u8],
         pb: i32,
@@ -1656,9 +1548,9 @@ impl WavefrontAligner {
         let mut score = 0;
         loop {
             // Always extend M wavefront (needed for correct propagation)
-            let m_idx = base.wf_components.get_m_idx(score as usize);
-            if m_idx != WAVEFRONT_IDX_NONE {
-                let wf = base.wavefront_slab.get_mut(m_idx);
+            let m_ptr = base.wf_components.get_m_ptr(score as usize);
+            if !m_ptr.is_null() {
+                let wf = unsafe { &mut *m_ptr };
                 if base.sequences.mode == SequenceMode::Lambda {
                     extend::extend_matches_custom_end2end(&base.sequences, wf);
                 } else {
@@ -1755,16 +1647,20 @@ impl WavefrontAligner {
         self.wf_components.resize(plen, tlen, &self.penalties);
         self.wavefront_slab.clear();
 
-        // Pre-size slab for CIGAR mode (BiWFA always needs full wavefronts)
-        if !self.wf_components.memory_modular {
+        // Pre-size slab to avoid Vec reallocations that would invalidate stored *mut Wavefront ptrs.
+        {
             let num_types = match self.penalties.distance_metric {
                 DistanceMetric::Edit | DistanceMetric::Indel => 1,
                 DistanceMetric::GapLinear => 1,
                 DistanceMetric::GapAffine => 3,
                 DistanceMetric::GapAffine2p => 5,
             };
-            self.wavefront_slab
-                .reserve(self.wf_components.num_wavefronts * num_types);
+            let capacity = if self.wf_components.memory_modular {
+                self.wf_components.max_score_scope * num_types + num_types
+            } else {
+                self.wf_components.num_wavefronts * num_types
+            };
+            self.wavefront_slab.reserve(capacity);
         }
 
         self.num_null_steps = 0;
@@ -1782,26 +1678,25 @@ impl WavefrontAligner {
         self.wf_components.resize_null_victim(eff_lo, eff_hi);
 
         // Allocate initial wavefront at score 0
-        let idx = self.wavefront_slab.allocate(eff_lo, eff_hi);
-        {
-            let wf = self.wavefront_slab.get_mut(idx);
-            wf.set_offset(0, 0);
-            wf.set_limits(0, 0);
+        let wf_ptr = self.wavefront_slab.allocate_ptr(eff_lo, eff_hi);
+        unsafe {
+            (*wf_ptr).set_offset(0, 0);
+            (*wf_ptr).set_limits(0, 0);
         }
 
         // Set the wavefront for the specified starting component
         match component {
-            ComponentType::M => self.wf_components.set_m_idx(0, idx),
-            ComponentType::I1 => self.wf_components.set_i1_idx(0, idx),
-            ComponentType::D1 => self.wf_components.set_d1_idx(0, idx),
-            ComponentType::I2 => self.wf_components.set_i2_idx(0, idx),
-            ComponentType::D2 => self.wf_components.set_d2_idx(0, idx),
+            ComponentType::M => self.wf_components.set_m_ptr(0, wf_ptr),
+            ComponentType::I1 => self.wf_components.set_i1_ptr(0, wf_ptr),
+            ComponentType::D1 => self.wf_components.set_d1_ptr(0, wf_ptr),
+            ComponentType::I2 => self.wf_components.set_i2_ptr(0, wf_ptr),
+            ComponentType::D2 => self.wf_components.set_d2_ptr(0, wf_ptr),
         }
     }
 
     /// Check if the specified wavefront component has reached the end diagonal.
     fn check_component_termination(
-        base: &mut WavefrontAligner,
+        base: &mut WavefrontAligner<N>,
         score: i32,
         component: ComponentType,
     ) -> bool {
@@ -1809,19 +1704,19 @@ impl WavefrontAligner {
         let tlen = base.sequences.text_length;
         let k_end = tlen - plen;
 
-        let idx = match component {
-            ComponentType::M => base.wf_components.get_m_idx(score as usize),
-            ComponentType::I1 => base.wf_components.get_i1_idx(score as usize),
-            ComponentType::D1 => base.wf_components.get_d1_idx(score as usize),
-            ComponentType::I2 => base.wf_components.get_i2_idx(score as usize),
-            ComponentType::D2 => base.wf_components.get_d2_idx(score as usize),
+        let ptr = match component {
+            ComponentType::M => base.wf_components.get_m_ptr(score as usize),
+            ComponentType::I1 => base.wf_components.get_i1_ptr(score as usize),
+            ComponentType::D1 => base.wf_components.get_d1_ptr(score as usize),
+            ComponentType::I2 => base.wf_components.get_i2_ptr(score as usize),
+            ComponentType::D2 => base.wf_components.get_d2_ptr(score as usize),
         };
 
-        if idx == WAVEFRONT_IDX_NONE {
+        if ptr.is_null() {
             return false;
         }
 
-        let wf = base.wavefront_slab.get(idx);
+        let wf = unsafe { &*ptr };
         if k_end >= wf.lo && k_end <= wf.hi && wf.get_offset(k_end) >= tlen {
             base.alignment_end_pos = WavefrontPos {
                 score,
@@ -1838,50 +1733,26 @@ impl WavefrontAligner {
     /// Free old wavefronts at the modular slot for affine (M, I1, D1).
     fn free_output_wavefronts_affine(&mut self, score: usize) {
         let score_mod = score % self.wf_components.max_score_scope;
-        let old_m = self.wf_components.get_m_idx(score_mod);
-        if old_m != WAVEFRONT_IDX_NONE {
-            self.wavefront_slab.free(old_m);
-        }
-        let old_i1 = self.wf_components.get_i1_idx(score_mod);
-        if old_i1 != WAVEFRONT_IDX_NONE {
-            self.wavefront_slab.free(old_i1);
-        }
-        let old_d1 = self.wf_components.get_d1_idx(score_mod);
-        if old_d1 != WAVEFRONT_IDX_NONE {
-            self.wavefront_slab.free(old_d1);
-        }
-        self.wf_components.set_m_idx(score, WAVEFRONT_IDX_NONE);
-        self.wf_components.set_i1_idx(score, WAVEFRONT_IDX_NONE);
-        self.wf_components.set_d1_idx(score, WAVEFRONT_IDX_NONE);
+        self.wavefront_slab.free_ptr(self.wf_components.get_m_ptr(score_mod));
+        self.wavefront_slab.free_ptr(self.wf_components.get_i1_ptr(score_mod));
+        self.wavefront_slab.free_ptr(self.wf_components.get_d1_ptr(score_mod));
+        self.wf_components.set_m_ptr(score, WF_PTR_NONE);
+        self.wf_components.set_i1_ptr(score, WF_PTR_NONE);
+        self.wf_components.set_d1_ptr(score, WF_PTR_NONE);
     }
 
     fn free_output_wavefronts_affine2p(&mut self, score: usize) {
         let score_mod = score % self.wf_components.max_score_scope;
-        let old_m = self.wf_components.get_m_idx(score_mod);
-        if old_m != WAVEFRONT_IDX_NONE {
-            self.wavefront_slab.free(old_m);
-        }
-        let old_i1 = self.wf_components.get_i1_idx(score_mod);
-        if old_i1 != WAVEFRONT_IDX_NONE {
-            self.wavefront_slab.free(old_i1);
-        }
-        let old_d1 = self.wf_components.get_d1_idx(score_mod);
-        if old_d1 != WAVEFRONT_IDX_NONE {
-            self.wavefront_slab.free(old_d1);
-        }
-        let old_i2 = self.wf_components.get_i2_idx(score_mod);
-        if old_i2 != WAVEFRONT_IDX_NONE {
-            self.wavefront_slab.free(old_i2);
-        }
-        let old_d2 = self.wf_components.get_d2_idx(score_mod);
-        if old_d2 != WAVEFRONT_IDX_NONE {
-            self.wavefront_slab.free(old_d2);
-        }
-        self.wf_components.set_m_idx(score, WAVEFRONT_IDX_NONE);
-        self.wf_components.set_i1_idx(score, WAVEFRONT_IDX_NONE);
-        self.wf_components.set_d1_idx(score, WAVEFRONT_IDX_NONE);
-        self.wf_components.set_i2_idx(score, WAVEFRONT_IDX_NONE);
-        self.wf_components.set_d2_idx(score, WAVEFRONT_IDX_NONE);
+        self.wavefront_slab.free_ptr(self.wf_components.get_m_ptr(score_mod));
+        self.wavefront_slab.free_ptr(self.wf_components.get_i1_ptr(score_mod));
+        self.wavefront_slab.free_ptr(self.wf_components.get_d1_ptr(score_mod));
+        self.wavefront_slab.free_ptr(self.wf_components.get_i2_ptr(score_mod));
+        self.wavefront_slab.free_ptr(self.wf_components.get_d2_ptr(score_mod));
+        self.wf_components.set_m_ptr(score, WF_PTR_NONE);
+        self.wf_components.set_i1_ptr(score, WF_PTR_NONE);
+        self.wf_components.set_d1_ptr(score, WF_PTR_NONE);
+        self.wf_components.set_i2_ptr(score, WF_PTR_NONE);
+        self.wf_components.set_d2_ptr(score, WF_PTR_NONE);
     }
 
     /// Dispatch compute step based on distance metric.
@@ -1896,11 +1767,11 @@ impl WavefrontAligner {
 
     /// Extend wavefront for BiWFA, returning max antidiagonal.
     fn extend_biwfa_max(&mut self, score: i32) -> i32 {
-        let m_idx = self.wf_components.get_m_idx(score as usize);
-        if m_idx == WAVEFRONT_IDX_NONE {
+        let m_ptr = self.wf_components.get_m_ptr(score as usize);
+        if m_ptr.is_null() {
             return 0;
         }
-        let wf = self.wavefront_slab.get_mut(m_idx);
+        let wf = unsafe { &mut *m_ptr };
         if self.sequences.mode == SequenceMode::Lambda {
             extend::extend_matches_custom_end2end_max(&self.sequences, wf)
         } else {
@@ -1910,11 +1781,11 @@ impl WavefrontAligner {
 
     /// Extend wavefront for BiWFA (no max tracking).
     fn extend_biwfa(&mut self, score: i32) {
-        let m_idx = self.wf_components.get_m_idx(score as usize);
-        if m_idx == WAVEFRONT_IDX_NONE {
+        let m_ptr = self.wf_components.get_m_ptr(score as usize);
+        if m_ptr.is_null() {
             return;
         }
-        let wf = self.wavefront_slab.get_mut(m_idx);
+        let wf = unsafe { &mut *m_ptr };
         if self.sequences.mode == SequenceMode::Lambda {
             extend::extend_matches_custom_end2end(&self.sequences, wf);
         } else {
@@ -1930,7 +1801,7 @@ mod tests {
 
     #[test]
     fn test_identical_sequences() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         let score = aligner.align_end2end(b"ACGT", b"ACGT");
         assert_eq!(score, 0);
         assert_eq!(aligner.status(), AlignStatus::Completed);
@@ -1938,7 +1809,7 @@ mod tests {
 
     #[test]
     fn test_one_mismatch() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         let score = aligner.align_end2end(b"ACGT", b"ACTT");
         assert_eq!(score, 1);
         assert_eq!(aligner.status(), AlignStatus::Completed);
@@ -1946,21 +1817,21 @@ mod tests {
 
     #[test]
     fn test_one_insertion() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         let score = aligner.align_end2end(b"ACT", b"ACGT");
         assert_eq!(score, 1);
     }
 
     #[test]
     fn test_one_deletion() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         let score = aligner.align_end2end(b"ACGT", b"ACT");
         assert_eq!(score, 1);
     }
 
     #[test]
     fn test_multiple_edits() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         // kitten → sitting: 3 edits (k→s, e→i, +g)
         let score = aligner.align_end2end(b"kitten", b"sitting");
         assert_eq!(score, 3);
@@ -1968,35 +1839,35 @@ mod tests {
 
     #[test]
     fn test_empty_vs_nonempty() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         let score = aligner.align_end2end(b"", b"ACGT");
         assert_eq!(score, 4);
     }
 
     #[test]
     fn test_nonempty_vs_empty() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         let score = aligner.align_end2end(b"ACGT", b"");
         assert_eq!(score, 4);
     }
 
     #[test]
     fn test_completely_different() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         let score = aligner.align_end2end(b"AAAA", b"TTTT");
         assert_eq!(score, 4);
     }
 
     #[test]
     fn test_longer_sequences() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         let score = aligner.align_end2end(b"ACGTACGTACGTACGT", b"ACGTACGTACGTACGT");
         assert_eq!(score, 0);
     }
 
     #[test]
     fn test_indel_distance() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_indel());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_indel());
         // Indel distance: only insertions and deletions, no substitutions
         // "ACGT" vs "ACTT": need to delete G, insert T → indel dist = 2
         let score = aligner.align_end2end(b"ACGT", b"ACTT");
@@ -2005,21 +1876,21 @@ mod tests {
 
     #[test]
     fn test_indel_identical() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_indel());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_indel());
         let score = aligner.align_end2end(b"ACGT", b"ACGT");
         assert_eq!(score, 0);
     }
 
     #[test]
     fn test_indel_insertion() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_indel());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_indel());
         let score = aligner.align_end2end(b"ACT", b"ACGT");
         assert_eq!(score, 1);
     }
 
     #[test]
     fn test_reuse_aligner() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         let score1 = aligner.align_end2end(b"ACGT", b"ACTT");
         assert_eq!(score1, 1);
 
@@ -2029,7 +1900,7 @@ mod tests {
 
     #[test]
     fn test_max_steps_limit() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         aligner.set_max_alignment_steps(2);
         let score = aligner.align_end2end(b"AAAA", b"TTTT");
         assert_eq!(aligner.status(), AlignStatus::MaxStepsReached);
@@ -2041,7 +1912,7 @@ mod tests {
 
     #[test]
     fn test_linear_identical() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_linear(
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_linear(
             crate::penalties::LinearPenalties {
                 match_: 0,
                 mismatch: 4,
@@ -2055,7 +1926,7 @@ mod tests {
 
     #[test]
     fn test_linear_one_mismatch() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_linear(
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_linear(
             crate::penalties::LinearPenalties {
                 match_: 0,
                 mismatch: 4,
@@ -2069,7 +1940,7 @@ mod tests {
 
     #[test]
     fn test_linear_one_insertion() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_linear(
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_linear(
             crate::penalties::LinearPenalties {
                 match_: 0,
                 mismatch: 4,
@@ -2082,7 +1953,7 @@ mod tests {
 
     #[test]
     fn test_linear_with_cigar() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_linear(
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_linear(
             crate::penalties::LinearPenalties {
                 match_: 0,
                 mismatch: 4,
@@ -2100,7 +1971,7 @@ mod tests {
 
     #[test]
     fn test_affine_identical() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_affine(
+        let mut aligner = AffineAligner::new(WavefrontPenalties::new_affine(
             crate::penalties::AffinePenalties {
                 match_: 0,
                 mismatch: 4,
@@ -2115,7 +1986,7 @@ mod tests {
 
     #[test]
     fn test_affine_one_mismatch() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_affine(
+        let mut aligner = AffineAligner::new(WavefrontPenalties::new_affine(
             crate::penalties::AffinePenalties {
                 match_: 0,
                 mismatch: 4,
@@ -2129,7 +2000,7 @@ mod tests {
 
     #[test]
     fn test_affine_one_insertion() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_affine(
+        let mut aligner = AffineAligner::new(WavefrontPenalties::new_affine(
             crate::penalties::AffinePenalties {
                 match_: 0,
                 mismatch: 4,
@@ -2143,7 +2014,7 @@ mod tests {
 
     #[test]
     fn test_affine_with_cigar() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_affine(
+        let mut aligner = AffineAligner::new(WavefrontPenalties::new_affine(
             crate::penalties::AffinePenalties {
                 match_: 0,
                 mismatch: 4,
@@ -2161,7 +2032,7 @@ mod tests {
     #[test]
     fn test_affine_gap_extend() {
         // Two consecutive insertions should cost O + 2*E = 6 + 4 = 10
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_affine(
+        let mut aligner = AffineAligner::new(WavefrontPenalties::new_affine(
             crate::penalties::AffinePenalties {
                 match_: 0,
                 mismatch: 4,
@@ -2178,7 +2049,7 @@ mod tests {
 
     #[test]
     fn test_affine_reuse() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_affine(
+        let mut aligner = AffineAligner::new(WavefrontPenalties::new_affine(
             crate::penalties::AffinePenalties {
                 match_: 0,
                 mismatch: 4,
@@ -2194,8 +2065,8 @@ mod tests {
 
     // --- Gap-affine 2-piece tests ---
 
-    fn make_affine2p_aligner() -> WavefrontAligner {
-        WavefrontAligner::new(WavefrontPenalties::new_affine2p(
+    fn make_affine2p_aligner() -> Affine2pAligner {
+        Affine2pAligner::new(WavefrontPenalties::new_affine2p(
             crate::penalties::Affine2pPenalties {
                 match_: 0,
                 mismatch: 4,
@@ -2255,7 +2126,7 @@ mod tests {
         // Pattern "ACGT" (4) vs Text "ACGTXXXX" (8)
         // With text_end_free=4: pattern fully consumed, remaining text (4) is free
         // Edit distance: score should be 0 (perfect match of pattern against text prefix)
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         aligner.set_alignment_free_ends(0, 0, 0, 4);
         let score = aligner.align_endsfree(b"ACGT", b"ACGTXXXX");
         assert_eq!(score, 0);
@@ -2266,7 +2137,7 @@ mod tests {
     fn test_endsfree_pattern_suffix_free() {
         // Pattern "ACGTXXXX" (8) vs Text "ACGT" (4)
         // With pattern_end_free=4: text fully consumed, remaining pattern (4) is free
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         aligner.set_alignment_free_ends(0, 4, 0, 0);
         let score = aligner.align_endsfree(b"ACGTXXXX", b"ACGT");
         assert_eq!(score, 0);
@@ -2276,7 +2147,7 @@ mod tests {
     #[test]
     fn test_endsfree_with_cigar() {
         // Ends-free with CIGAR computation
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         aligner.alignment_scope = AlignmentScope::ComputeAlignment;
         aligner.set_alignment_free_ends(0, 0, 0, 4);
         let score = aligner.align_endsfree(b"ACGT", b"ACGTXXXX");
@@ -2290,7 +2161,7 @@ mod tests {
     fn test_endsfree_with_mismatch() {
         // Pattern "ACGT" vs Text "ACTTXXXX"
         // With text_end_free=4: one mismatch at position 2
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         aligner.set_alignment_free_ends(0, 0, 0, 4);
         let score = aligner.align_endsfree(b"ACGT", b"ACTTXXXX");
         assert_eq!(score, 1);
@@ -2299,7 +2170,7 @@ mod tests {
     #[test]
     fn test_endsfree_affine() {
         // Affine ends-free: pattern fully consumed with text suffix free
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_affine(
+        let mut aligner = AffineAligner::new(WavefrontPenalties::new_affine(
             crate::penalties::AffinePenalties {
                 match_: 0,
                 mismatch: 4,
@@ -2317,7 +2188,7 @@ mod tests {
     #[test]
     fn test_extension_basic() {
         // Extension mode: find maximal-scoring prefix
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_affine(
+        let mut aligner = AffineAligner::new(WavefrontPenalties::new_affine(
             crate::penalties::AffinePenalties {
                 match_: 0,
                 mismatch: 4,
@@ -2341,7 +2212,7 @@ mod tests {
     #[test]
     fn test_extension_identical() {
         // Extension with identical sequences: no trim needed
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_affine(
+        let mut aligner = AffineAligner::new(WavefrontPenalties::new_affine(
             crate::penalties::AffinePenalties {
                 match_: 0,
                 mismatch: 4,
@@ -2371,14 +2242,14 @@ mod tests {
         let text = b"GCCTGGTTCAAAACTACTGTGACTGCCAGAGCCTCTCAGGCTTGAGGGCAGACTTACAAAAGCGCGGTTCGAACTATCGCGACAACACCACGGTAACGTC";
 
         // Standard alignment
-        let mut std_aligner = WavefrontAligner::new(penalties.clone());
+        let mut std_aligner = AffineAligner::new(penalties.clone());
         std_aligner.alignment_scope = AlignmentScope::ComputeAlignment;
         let std_score = std_aligner.align_end2end(pattern, text);
         let std_cigar = std_aligner.cigar().to_string_rle(true);
         std_aligner.cigar().check_alignment(pattern, text).unwrap();
 
         // BiWFA
-        let mut biwfa_aligner = WavefrontAligner::new(penalties);
+        let mut biwfa_aligner = AffineAligner::new(penalties);
         let biwfa_score = biwfa_aligner.align_biwfa(pattern, text);
         let biwfa_cigar = biwfa_aligner.cigar().to_string_rle(true);
 
@@ -2400,7 +2271,7 @@ mod tests {
 
     #[test]
     fn test_biwfa_identical_sequences() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         let score = aligner.align_biwfa(b"ACGTACGT", b"ACGTACGT");
         assert_eq!(score, 0);
         aligner
@@ -2411,14 +2282,14 @@ mod tests {
 
     #[test]
     fn test_biwfa_edit_simple() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         let pattern = b"ACGTACGT";
         let text = b"ACTTACGT";
         let biwfa_score = aligner.align_biwfa(pattern, text);
         aligner.cigar().check_alignment(pattern, text).unwrap();
 
         // Compare with standard WFA
-        let mut std_aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut std_aligner = EditAligner::new(WavefrontPenalties::new_edit());
         std_aligner.alignment_scope = AlignmentScope::ComputeAlignment;
         let std_score = std_aligner.align_end2end(pattern, text);
         assert_eq!(biwfa_score, std_score);
@@ -2426,13 +2297,13 @@ mod tests {
 
     #[test]
     fn test_biwfa_edit_with_indels() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         let pattern = b"ACGTACGTACGT";
         let text = b"ACGACGTAGT";
         let biwfa_score = aligner.align_biwfa(pattern, text);
         aligner.cigar().check_alignment(pattern, text).unwrap();
 
-        let mut std_aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut std_aligner = EditAligner::new(WavefrontPenalties::new_edit());
         std_aligner.alignment_scope = AlignmentScope::ComputeAlignment;
         let std_score = std_aligner.align_end2end(pattern, text);
         assert_eq!(biwfa_score, std_score);
@@ -2440,7 +2311,7 @@ mod tests {
 
     #[test]
     fn test_biwfa_affine_simple() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_affine(
+        let mut aligner = AffineAligner::new(WavefrontPenalties::new_affine(
             crate::penalties::AffinePenalties {
                 match_: 0,
                 mismatch: 4,
@@ -2453,7 +2324,7 @@ mod tests {
         let biwfa_score = aligner.align_biwfa(pattern, text);
         aligner.cigar().check_alignment(pattern, text).unwrap();
 
-        let mut std_aligner = WavefrontAligner::new(WavefrontPenalties::new_affine(
+        let mut std_aligner = AffineAligner::new(WavefrontPenalties::new_affine(
             crate::penalties::AffinePenalties {
                 match_: 0,
                 mismatch: 4,
