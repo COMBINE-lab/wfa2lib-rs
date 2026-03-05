@@ -7,7 +7,8 @@ use clap::Parser;
 #[cfg(feature = "mimalloc-alloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-use wfa2lib_rs::aligner::{AlignmentScope, WavefrontAligner};
+use wfa2lib_rs::aligner::{AffineAligner, Affine2pAligner, AlignmentScope, EditAligner};
+use wfa2lib_rs::cigar::Cigar;
 use wfa2lib_rs::heuristic::HeuristicStrategy;
 use wfa2lib_rs::penalties::{
     Affine2pPenalties, AffinePenalties, DistanceMetric, LinearPenalties, WavefrontPenalties,
@@ -206,8 +207,78 @@ fn parse_heuristic(name: &str, params: Option<&str>) -> HeuristicStrategy {
     }
 }
 
+/// Runtime-dispatched aligner for any distance metric.
+///
+/// Since the metric is chosen at runtime (CLI argument), we cannot use a single
+/// `WavefrontAligner<N>`. This enum wraps all three concrete types.
+enum AnyAligner {
+    N1(EditAligner),
+    N3(AffineAligner),
+    N5(Affine2pAligner),
+}
+
+impl AnyAligner {
+    fn align_end2end(&mut self, pattern: &[u8], text: &[u8]) -> i32 {
+        match self {
+            AnyAligner::N1(a) => a.align_end2end(pattern, text),
+            AnyAligner::N3(a) => a.align_end2end(pattern, text),
+            AnyAligner::N5(a) => a.align_end2end(pattern, text),
+        }
+    }
+
+    fn align_biwfa(&mut self, pattern: &[u8], text: &[u8]) -> i32 {
+        match self {
+            AnyAligner::N1(a) => a.align_biwfa(pattern, text),
+            AnyAligner::N3(a) => a.align_biwfa(pattern, text),
+            AnyAligner::N5(a) => a.align_biwfa(pattern, text),
+        }
+    }
+
+    fn cigar(&self) -> &Cigar {
+        match self {
+            AnyAligner::N1(a) => a.cigar(),
+            AnyAligner::N3(a) => a.cigar(),
+            AnyAligner::N5(a) => a.cigar(),
+        }
+    }
+
+    fn set_heuristic(&mut self, strategy: HeuristicStrategy) {
+        match self {
+            AnyAligner::N1(a) => a.set_heuristic(strategy),
+            AnyAligner::N3(a) => a.set_heuristic(strategy),
+            AnyAligner::N5(a) => a.set_heuristic(strategy),
+        }
+    }
+
+    fn set_max_alignment_steps(&mut self, max_steps: i32) {
+        match self {
+            AnyAligner::N1(a) => a.set_max_alignment_steps(max_steps),
+            AnyAligner::N3(a) => a.set_max_alignment_steps(max_steps),
+            AnyAligner::N5(a) => a.set_max_alignment_steps(max_steps),
+        }
+    }
+
+    fn set_alignment_scope(&mut self, scope: AlignmentScope) {
+        match self {
+            AnyAligner::N1(a) => a.alignment_scope = scope,
+            AnyAligner::N3(a) => a.alignment_scope = scope,
+            AnyAligner::N5(a) => a.alignment_scope = scope,
+        }
+    }
+}
+
+fn build_aligner(penalties: WavefrontPenalties) -> AnyAligner {
+    match penalties.distance_metric {
+        DistanceMetric::Edit | DistanceMetric::Indel | DistanceMetric::GapLinear => {
+            AnyAligner::N1(EditAligner::new(penalties))
+        }
+        DistanceMetric::GapAffine => AnyAligner::N3(AffineAligner::new(penalties)),
+        DistanceMetric::GapAffine2p => AnyAligner::N5(Affine2pAligner::new(penalties)),
+    }
+}
+
 fn compute_output_score(
-    aligner: &WavefrontAligner,
+    cigar: &Cigar,
     wfa_score: i32,
     penalties: &WavefrontPenalties,
     score_only: bool,
@@ -217,15 +288,12 @@ fn compute_output_score(
     if !score_only {
         // CIGAR mode: compute score from CIGAR using original penalties
         match penalties.distance_metric {
-            DistanceMetric::Indel | DistanceMetric::Edit => aligner.cigar().score_edit(),
-            DistanceMetric::GapLinear => aligner
-                .cigar()
+            DistanceMetric::Indel | DistanceMetric::Edit => cigar.score_edit(),
+            DistanceMetric::GapLinear => cigar
                 .score_gap_linear(penalties.linear_penalties.as_ref().unwrap()),
-            DistanceMetric::GapAffine => aligner
-                .cigar()
+            DistanceMetric::GapAffine => cigar
                 .score_gap_affine(penalties.affine_penalties.as_ref().unwrap()),
-            DistanceMetric::GapAffine2p => aligner
-                .cigar()
+            DistanceMetric::GapAffine2p => cigar
                 .score_gap_affine2p(penalties.affine2p_penalties.as_ref().unwrap()),
         }
     } else {
@@ -252,10 +320,10 @@ fn main() {
     let use_biwfa = cli.wfa_memory.as_deref() == Some("ultralow");
     let do_check = cli.check.is_some() && !score_only;
 
-    let mut aligner = WavefrontAligner::new(penalties.clone());
+    let mut aligner = build_aligner(penalties.clone());
 
     if !score_only {
-        aligner.alignment_scope = AlignmentScope::ComputeAlignment;
+        aligner.set_alignment_scope(AlignmentScope::ComputeAlignment);
     }
 
     if let Some(ref heuristic) = cli.wfa_heuristic {
@@ -283,7 +351,7 @@ fn main() {
         align_nanos += t0.elapsed().as_nanos() as u64;
 
         let output_score = compute_output_score(
-            &aligner,
+            aligner.cigar(),
             wfa_score,
             &penalties,
             score_only,

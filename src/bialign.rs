@@ -4,7 +4,6 @@
 //! Forward and reverse wavefronts expand toward each other until they overlap,
 //! producing a breakpoint that splits the problem into two halves.
 
-use crate::components::WF_PTR_NONE;
 use crate::offset::{WfOffset, wavefront_k_inverse, wavefront_v};
 use crate::wavefront::Wavefront;
 
@@ -287,7 +286,7 @@ pub fn breakpoint_indel2indel(
 /// Wavefront access helper: get a wavefront from a raw pointer.
 /// Returns None if the pointer is null or the wavefront is null.
 fn get_wf_if_valid(ptr: *mut Wavefront) -> Option<&'static Wavefront> {
-    if ptr == WF_PTR_NONE {
+    if ptr.is_null() {
         return None;
     }
     let wf = unsafe { &*ptr };
@@ -302,9 +301,11 @@ fn get_wf_if_valid(ptr: *mut Wavefront) -> Option<&'static Wavefront> {
 /// `aligner_0` is at `score_0`, `aligner_1` is checked from `score_1` downward.
 /// `breakpoint_forward`: true if aligner_0 is the forward aligner.
 #[allow(clippy::too_many_arguments)]
-pub fn bialign_overlap(
-    components_0: &crate::components::WavefrontComponents,
-    components_1: &crate::components::WavefrontComponents,
+pub fn bialign_overlap<const N: usize>(
+    components_0: &crate::components::WavefrontComponents<N>,
+    _slab_0: &crate::slab::WavefrontSlab,
+    components_1: &crate::components::WavefrontComponents<N>,
+    _slab_1: &crate::slab::WavefrontSlab,
     score_0: i32,
     score_1: i32,
     pattern_length: i32,

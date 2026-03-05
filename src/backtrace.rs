@@ -10,6 +10,7 @@ use crate::cigar::Cigar;
 use crate::components::WavefrontComponents;
 use crate::offset::{OFFSET_NULL, wavefront_h, wavefront_v};
 use crate::penalties::{DistanceMetric, WavefrontPenalties};
+use crate::slab::WavefrontSlab;
 
 // Backtrace type constants (packed into low 4 bits of i64).
 // Higher values win ties when offsets are equal.
@@ -42,7 +43,7 @@ fn piggyback_get_type(value: i64) -> i64 {
 
 /// Look up mismatch predecessor: M-wavefront at (score, k), offset + 1.
 #[inline(always)]
-fn bt_misms(wf_components: &WavefrontComponents, score: i32, k: i32) -> i64 {
+fn bt_misms<const N: usize>(wf_components: &WavefrontComponents<N>, score: i32, k: i32) -> i64 {
     if score < 0 {
         return OFFSET_NULL as i64;
     }
@@ -60,8 +61,8 @@ fn bt_misms(wf_components: &WavefrontComponents, score: i32, k: i32) -> i64 {
 
 /// Look up insertion predecessor: M-wavefront at (score, k-1), offset + 1.
 #[inline(always)]
-fn bt_ins1_open(
-    wf_components: &WavefrontComponents,
+fn bt_ins1_open<const N: usize>(
+    wf_components: &WavefrontComponents<N>,
     score: i32,
     k: i32,
 ) -> i64 {
@@ -82,8 +83,8 @@ fn bt_ins1_open(
 
 /// Look up deletion predecessor: M-wavefront at (score, k+1), offset unchanged.
 #[inline(always)]
-fn bt_del1_open(
-    wf_components: &WavefrontComponents,
+fn bt_del1_open<const N: usize>(
+    wf_components: &WavefrontComponents<N>,
     score: i32,
     k: i32,
 ) -> i64 {
@@ -119,8 +120,9 @@ fn write_matches(cigar: &mut Cigar, num_matches: i32) {
 /// Walks backwards through all stored M-wavefronts from the alignment endpoint
 /// to reconstruct the full alignment. The CIGAR is built from end to beginning.
 #[allow(clippy::too_many_arguments)]
-pub fn backtrace_linear(
-    wf_components: &WavefrontComponents,
+pub fn backtrace_linear<const N: usize>(
+    wf_components: &WavefrontComponents<N>,
+    _slab: &WavefrontSlab,
     penalties: &WavefrontPenalties,
     pattern_length: i32,
     text_length: i32,
@@ -250,7 +252,7 @@ pub fn backtrace_linear(
 
 /// Look up I1-wavefront at (score, k): returns piggyback(offset, BT_I1_EXT).
 #[inline(always)]
-fn bt_i1_ext(wf_components: &WavefrontComponents, score: i32, k: i32) -> i64 {
+fn bt_i1_ext<const N: usize>(wf_components: &WavefrontComponents<N>, score: i32, k: i32) -> i64 {
     if score < 0 {
         return OFFSET_NULL as i64;
     }
@@ -268,7 +270,7 @@ fn bt_i1_ext(wf_components: &WavefrontComponents, score: i32, k: i32) -> i64 {
 
 /// Look up D1-wavefront at (score, k): returns piggyback(offset, BT_D1_EXT).
 #[inline(always)]
-fn bt_d1_ext(wf_components: &WavefrontComponents, score: i32, k: i32) -> i64 {
+fn bt_d1_ext<const N: usize>(wf_components: &WavefrontComponents<N>, score: i32, k: i32) -> i64 {
     if score < 0 {
         return OFFSET_NULL as i64;
     }
@@ -286,10 +288,10 @@ fn bt_d1_ext(wf_components: &WavefrontComponents, score: i32, k: i32) -> i64 {
 
 /// Look up both M→I1 open (k-1, offset+1) and M→D1 open (k+1, offset) from
 /// the same M-wavefront at the given score. Returns (ins1_open, del1_open).
-/// This avoids a redundant get_m_ptr double-fetch.
+/// This avoids a redundant double-fetch.
 #[inline(always)]
-fn bt_open1_pair(
-    wf_components: &WavefrontComponents,
+fn bt_open1_pair<const N: usize>(
+    wf_components: &WavefrontComponents<N>,
     score: i32,
     k: i32,
 ) -> (i64, i64) {
@@ -319,8 +321,8 @@ fn bt_open1_pair(
 
 /// Affine backtrace: look up I1 extend at (score, k-1), offset + 1.
 #[inline(always)]
-fn bt_affine_ins1_ext(
-    wf_components: &WavefrontComponents,
+fn bt_affine_ins1_ext<const N: usize>(
+    wf_components: &WavefrontComponents<N>,
     score: i32,
     k: i32,
 ) -> i64 {
@@ -341,8 +343,8 @@ fn bt_affine_ins1_ext(
 
 /// Affine backtrace: look up D1 extend at (score, k+1), offset unchanged.
 #[inline(always)]
-fn bt_affine_del1_ext(
-    wf_components: &WavefrontComponents,
+fn bt_affine_del1_ext<const N: usize>(
+    wf_components: &WavefrontComponents<N>,
     score: i32,
     k: i32,
 ) -> i64 {
@@ -368,8 +370,9 @@ fn bt_affine_del1_ext(
 /// In I1-state: predecessors are gap open (M→I1) or gap extend (I1→I1).
 /// In D1-state: predecessors are gap open (M→D1) or gap extend (D1→D1).
 #[allow(clippy::too_many_arguments)]
-pub fn backtrace_affine(
-    wf_components: &WavefrontComponents,
+pub fn backtrace_affine<const N: usize>(
+    wf_components: &WavefrontComponents<N>,
+    _slab: &WavefrontSlab,
     penalties: &WavefrontPenalties,
     pattern_length: i32,
     text_length: i32,
@@ -569,7 +572,7 @@ pub fn backtrace_affine(
 
 /// Look up I2-wavefront at (score, k): returns piggyback(offset, BT_I2_EXT).
 #[inline(always)]
-fn bt_i2_ext(wf_components: &WavefrontComponents, score: i32, k: i32) -> i64 {
+fn bt_i2_ext<const N: usize>(wf_components: &WavefrontComponents<N>, score: i32, k: i32) -> i64 {
     if score < 0 {
         return OFFSET_NULL as i64;
     }
@@ -587,7 +590,7 @@ fn bt_i2_ext(wf_components: &WavefrontComponents, score: i32, k: i32) -> i64 {
 
 /// Look up D2-wavefront at (score, k): returns piggyback(offset, BT_D2_EXT).
 #[inline(always)]
-fn bt_d2_ext(wf_components: &WavefrontComponents, score: i32, k: i32) -> i64 {
+fn bt_d2_ext<const N: usize>(wf_components: &WavefrontComponents<N>, score: i32, k: i32) -> i64 {
     if score < 0 {
         return OFFSET_NULL as i64;
     }
@@ -606,8 +609,8 @@ fn bt_d2_ext(wf_components: &WavefrontComponents, score: i32, k: i32) -> i64 {
 /// Look up both M→I2 open (k-1, offset+1) and M→D2 open (k+1, offset) from
 /// the same M-wavefront at the given score. Returns (ins2_open, del2_open).
 #[inline(always)]
-fn bt_open2_pair(
-    wf_components: &WavefrontComponents,
+fn bt_open2_pair<const N: usize>(
+    wf_components: &WavefrontComponents<N>,
     score: i32,
     k: i32,
 ) -> (i64, i64) {
@@ -637,8 +640,8 @@ fn bt_open2_pair(
 
 /// Affine2p backtrace: look up I2 extend at (score, k-1), offset + 1.
 #[inline(always)]
-fn bt_affine_ins2_ext(
-    wf_components: &WavefrontComponents,
+fn bt_affine_ins2_ext<const N: usize>(
+    wf_components: &WavefrontComponents<N>,
     score: i32,
     k: i32,
 ) -> i64 {
@@ -659,8 +662,8 @@ fn bt_affine_ins2_ext(
 
 /// Affine2p backtrace: look up D2 extend at (score, k+1), offset unchanged.
 #[inline(always)]
-fn bt_affine_del2_ext(
-    wf_components: &WavefrontComponents,
+fn bt_affine_del2_ext<const N: usize>(
+    wf_components: &WavefrontComponents<N>,
     score: i32,
     k: i32,
 ) -> i64 {
@@ -683,8 +686,9 @@ fn bt_affine_del2_ext(
 ///
 /// Uses a 5-state machine tracking current matrix type (M, I1, D1, I2, D2).
 #[allow(clippy::too_many_arguments)]
-pub fn backtrace_affine2p(
-    wf_components: &WavefrontComponents,
+pub fn backtrace_affine2p<const N: usize>(
+    wf_components: &WavefrontComponents<N>,
+    _slab: &WavefrontSlab,
     penalties: &WavefrontPenalties,
     pattern_length: i32,
     text_length: i32,
@@ -938,11 +942,11 @@ pub fn backtrace_affine2p(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::aligner::{AlignStatus, AlignmentScope, WavefrontAligner};
+    use crate::aligner::{AlignStatus, AlignmentScope, EditAligner};
 
     #[test]
     fn test_backtrace_identical() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         aligner.alignment_scope = AlignmentScope::ComputeAlignment;
         let score = aligner.align_end2end(b"ACGT", b"ACGT");
         assert_eq!(score, 0);
@@ -953,7 +957,7 @@ mod tests {
 
     #[test]
     fn test_backtrace_one_mismatch() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         aligner.alignment_scope = AlignmentScope::ComputeAlignment;
         let score = aligner.align_end2end(b"ACGT", b"ACTT");
         assert_eq!(score, 1);
@@ -963,7 +967,7 @@ mod tests {
 
     #[test]
     fn test_backtrace_one_insertion() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         aligner.alignment_scope = AlignmentScope::ComputeAlignment;
         let score = aligner.align_end2end(b"ACT", b"ACGT");
         assert_eq!(score, 1);
@@ -974,7 +978,7 @@ mod tests {
 
     #[test]
     fn test_backtrace_one_deletion() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         aligner.alignment_scope = AlignmentScope::ComputeAlignment;
         let score = aligner.align_end2end(b"ACGT", b"ACT");
         assert_eq!(score, 1);
@@ -985,7 +989,7 @@ mod tests {
 
     #[test]
     fn test_backtrace_multiple_edits() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         aligner.alignment_scope = AlignmentScope::ComputeAlignment;
         let score = aligner.align_end2end(b"kitten", b"sitting");
         assert_eq!(score, 3);
@@ -996,7 +1000,7 @@ mod tests {
 
     #[test]
     fn test_backtrace_empty_vs_nonempty() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         aligner.alignment_scope = AlignmentScope::ComputeAlignment;
         let score = aligner.align_end2end(b"", b"ACGT");
         assert_eq!(score, 4);
@@ -1005,7 +1009,7 @@ mod tests {
 
     #[test]
     fn test_backtrace_nonempty_vs_empty() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         aligner.alignment_scope = AlignmentScope::ComputeAlignment;
         let score = aligner.align_end2end(b"ACGT", b"");
         assert_eq!(score, 4);
@@ -1014,7 +1018,7 @@ mod tests {
 
     #[test]
     fn test_backtrace_indel_distance() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_indel());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_indel());
         aligner.alignment_scope = AlignmentScope::ComputeAlignment;
         let score = aligner.align_end2end(b"ACGT", b"ACTT");
         assert_eq!(score, 2);
@@ -1031,7 +1035,7 @@ mod tests {
 
     #[test]
     fn test_backtrace_completely_different() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         aligner.alignment_scope = AlignmentScope::ComputeAlignment;
         let score = aligner.align_end2end(b"AAAA", b"TTTT");
         assert_eq!(score, 4);
