@@ -4,8 +4,8 @@
 //! Forward and reverse wavefronts expand toward each other until they overlap,
 //! producing a breakpoint that splits the problem into two halves.
 
+use crate::components::WF_PTR_NONE;
 use crate::offset::{WfOffset, wavefront_k_inverse, wavefront_v};
-use crate::slab::WAVEFRONT_IDX_NONE;
 use crate::wavefront::Wavefront;
 
 /// DP matrix component type for BiWFA breakpoints.
@@ -284,13 +284,13 @@ pub fn breakpoint_indel2indel(
     }
 }
 
-/// Wavefront access helper: get a wavefront from a slab by component index function.
-/// Returns None if the index is WAVEFRONT_IDX_NONE or the wavefront is null.
-fn get_wf_if_valid(slab: &crate::slab::WavefrontSlab, idx: usize) -> Option<&Wavefront> {
-    if idx == WAVEFRONT_IDX_NONE {
+/// Wavefront access helper: get a wavefront from a raw pointer.
+/// Returns None if the pointer is null or the wavefront is null.
+fn get_wf_if_valid(ptr: *mut Wavefront) -> Option<&'static Wavefront> {
+    if ptr == WF_PTR_NONE {
         return None;
     }
-    let wf = slab.get(idx);
+    let wf = unsafe { &*ptr };
     if wf.null {
         return None;
     }
@@ -304,9 +304,7 @@ fn get_wf_if_valid(slab: &crate::slab::WavefrontSlab, idx: usize) -> Option<&Wav
 #[allow(clippy::too_many_arguments)]
 pub fn bialign_overlap(
     components_0: &crate::components::WavefrontComponents,
-    slab_0: &crate::slab::WavefrontSlab,
     components_1: &crate::components::WavefrontComponents,
-    slab_1: &crate::slab::WavefrontSlab,
     score_0: i32,
     score_1: i32,
     pattern_length: i32,
@@ -321,30 +319,29 @@ pub fn bialign_overlap(
     let max_score_scope = components_1.max_score_scope;
 
     // Get M-wavefront at score_0
-    let m_idx_0 = components_0.get_m_idx(score_0 as usize);
-    let mwf_0 = match get_wf_if_valid(slab_0, m_idx_0) {
+    let mwf_0 = match get_wf_if_valid(components_0.get_m_ptr(score_0 as usize)) {
         Some(wf) => wf,
         None => return,
     };
 
     // Also get I/D wavefronts at score_0 (for indel-to-indel checks)
     let d1wf_0 = if has_affine {
-        get_wf_if_valid(slab_0, components_0.get_d1_idx(score_0 as usize))
+        get_wf_if_valid(components_0.get_d1_ptr(score_0 as usize))
     } else {
         None
     };
     let i1wf_0 = if has_affine {
-        get_wf_if_valid(slab_0, components_0.get_i1_idx(score_0 as usize))
+        get_wf_if_valid(components_0.get_i1_ptr(score_0 as usize))
     } else {
         None
     };
     let d2wf_0 = if has_affine2p {
-        get_wf_if_valid(slab_0, components_0.get_d2_idx(score_0 as usize))
+        get_wf_if_valid(components_0.get_d2_ptr(score_0 as usize))
     } else {
         None
     };
     let i2wf_0 = if has_affine2p {
-        get_wf_if_valid(slab_0, components_0.get_i2_idx(score_0 as usize))
+        get_wf_if_valid(components_0.get_i2_ptr(score_0 as usize))
     } else {
         None
     };
@@ -360,7 +357,7 @@ pub fn bialign_overlap(
         if has_affine2p && score_0 + score_i - gap_opening2 < breakpoint.score {
             if let (Some(d2wf_0), Some(d2wf_1)) = (
                 d2wf_0,
-                get_wf_if_valid(slab_1, components_1.get_d2_idx(score_i as usize)),
+                get_wf_if_valid(components_1.get_d2_ptr(score_i as usize)),
             ) {
                 breakpoint_indel2indel(
                     d2wf_0,
@@ -377,7 +374,7 @@ pub fn bialign_overlap(
             }
             if let (Some(i2wf_0), Some(i2wf_1)) = (
                 i2wf_0,
-                get_wf_if_valid(slab_1, components_1.get_i2_idx(score_i as usize)),
+                get_wf_if_valid(components_1.get_i2_ptr(score_i as usize)),
             ) {
                 breakpoint_indel2indel(
                     i2wf_0,
@@ -398,7 +395,7 @@ pub fn bialign_overlap(
         if has_affine && score_0 + score_i - gap_opening1 < breakpoint.score {
             if let (Some(d1wf_0), Some(d1wf_1)) = (
                 d1wf_0,
-                get_wf_if_valid(slab_1, components_1.get_d1_idx(score_i as usize)),
+                get_wf_if_valid(components_1.get_d1_ptr(score_i as usize)),
             ) {
                 breakpoint_indel2indel(
                     d1wf_0,
@@ -415,7 +412,7 @@ pub fn bialign_overlap(
             }
             if let (Some(i1wf_0), Some(i1wf_1)) = (
                 i1wf_0,
-                get_wf_if_valid(slab_1, components_1.get_i1_idx(score_i as usize)),
+                get_wf_if_valid(components_1.get_i1_ptr(score_i as usize)),
             ) {
                 breakpoint_indel2indel(
                     i1wf_0,
@@ -436,7 +433,7 @@ pub fn bialign_overlap(
         if score_0 + score_i >= breakpoint.score {
             continue;
         }
-        if let Some(mwf_1) = get_wf_if_valid(slab_1, components_1.get_m_idx(score_i as usize)) {
+        if let Some(mwf_1) = get_wf_if_valid(components_1.get_m_ptr(score_i as usize)) {
             breakpoint_m2m(
                 mwf_0,
                 mwf_1,

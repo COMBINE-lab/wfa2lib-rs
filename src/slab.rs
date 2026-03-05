@@ -223,6 +223,50 @@ impl WavefrontSlab {
         unsafe { self.wavefronts.as_mut_ptr().add(idx) }
     }
 
+    /// Allocate a wavefront and return a raw pointer to it.
+    pub fn allocate_ptr(&mut self, min_lo: i32, max_hi: i32) -> *mut Wavefront {
+        let idx = self.allocate(min_lo, max_hi);
+        unsafe { self.wavefronts.as_mut_ptr().add(idx) }
+    }
+
+    /// Reinitialize an existing wavefront in-place via pointer.
+    ///
+    /// # Safety
+    /// `ptr` must be a valid pointer into this slab's wavefront storage.
+    #[inline(always)]
+    pub unsafe fn reuse_inplace_ptr(&mut self, ptr: *mut Wavefront, min_lo: i32, max_hi: i32) {
+        unsafe {
+            (*ptr).init(min_lo, max_hi);
+            (*ptr).status = WavefrontStatus::Busy;
+        }
+    }
+
+    /// Reuse existing wavefront (if non-null) or allocate new one, returning a pointer.
+    #[inline(always)]
+    pub fn reuse_or_allocate_ptr(
+        &mut self,
+        old_ptr: *mut Wavefront,
+        min_lo: i32,
+        max_hi: i32,
+    ) -> *mut Wavefront {
+        if !old_ptr.is_null() {
+            unsafe { self.reuse_inplace_ptr(old_ptr, min_lo, max_hi); }
+            old_ptr
+        } else {
+            self.allocate_ptr(min_lo, max_hi)
+        }
+    }
+
+    /// Free a wavefront by pointer (returns to free list for reuse).
+    pub fn free_ptr(&mut self, ptr: *mut Wavefront) {
+        if ptr.is_null() {
+            return;
+        }
+        let base = self.wavefronts.as_ptr();
+        let idx = unsafe { (ptr as *const Wavefront).offset_from(base) } as usize;
+        self.free(idx);
+    }
+
     /// Get two mutable references to different wavefronts (panics if same index).
     #[inline(always)]
     pub fn get_two_mut(
