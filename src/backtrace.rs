@@ -42,6 +42,7 @@ fn piggyback_get_type(value: i64) -> i64 {
 }
 
 /// Look up mismatch predecessor: M-wavefront at (score, k), offset + 1.
+#[inline(always)]
 fn bt_misms(wf_components: &WavefrontComponents, slab: &WavefrontSlab, score: i32, k: i32) -> i64 {
     if score < 0 {
         return OFFSET_NULL as i64;
@@ -59,6 +60,7 @@ fn bt_misms(wf_components: &WavefrontComponents, slab: &WavefrontSlab, score: i3
 }
 
 /// Look up insertion predecessor: M-wavefront at (score, k-1), offset + 1.
+#[inline(always)]
 fn bt_ins1_open(
     wf_components: &WavefrontComponents,
     slab: &WavefrontSlab,
@@ -81,6 +83,7 @@ fn bt_ins1_open(
 }
 
 /// Look up deletion predecessor: M-wavefront at (score, k+1), offset unchanged.
+#[inline(always)]
 fn bt_del1_open(
     wf_components: &WavefrontComponents,
     slab: &WavefrontSlab,
@@ -103,12 +106,15 @@ fn bt_del1_open(
 }
 
 /// Write `num_matches` 'M' operations into the CIGAR (backwards).
-#[inline]
+#[inline(always)]
 fn write_matches(cigar: &mut Cigar, num_matches: i32) {
-    for _ in 0..num_matches {
-        cigar.operations[cigar.begin_offset] = b'M';
-        cigar.begin_offset -= 1;
+    if num_matches <= 0 {
+        return;
     }
+    let n = num_matches as usize;
+    let start = cigar.begin_offset + 1 - n;
+    cigar.operations[start..cigar.begin_offset + 1].fill(b'M');
+    cigar.begin_offset = start - 1;
 }
 
 /// Perform backtrace for linear (edit/indel) distance, building a CIGAR.
@@ -247,6 +253,7 @@ pub fn backtrace_linear(
 // --- Affine backtrace helpers ---
 
 /// Look up I1-wavefront at (score, k): returns piggyback(offset, BT_I1_EXT).
+#[inline(always)]
 fn bt_i1_ext(wf_components: &WavefrontComponents, slab: &WavefrontSlab, score: i32, k: i32) -> i64 {
     if score < 0 {
         return OFFSET_NULL as i64;
@@ -264,6 +271,7 @@ fn bt_i1_ext(wf_components: &WavefrontComponents, slab: &WavefrontSlab, score: i
 }
 
 /// Look up D1-wavefront at (score, k): returns piggyback(offset, BT_D1_EXT).
+#[inline(always)]
 fn bt_d1_ext(wf_components: &WavefrontComponents, slab: &WavefrontSlab, score: i32, k: i32) -> i64 {
     if score < 0 {
         return OFFSET_NULL as i64;
@@ -281,6 +289,7 @@ fn bt_d1_ext(wf_components: &WavefrontComponents, slab: &WavefrontSlab, score: i
 }
 
 /// Affine backtrace: look up M→I1 open at (score, k-1), offset + 1.
+#[inline(always)]
 fn bt_affine_ins1_open(
     wf_components: &WavefrontComponents,
     slab: &WavefrontSlab,
@@ -303,6 +312,7 @@ fn bt_affine_ins1_open(
 }
 
 /// Affine backtrace: look up I1 extend at (score, k-1), offset + 1.
+#[inline(always)]
 fn bt_affine_ins1_ext(
     wf_components: &WavefrontComponents,
     slab: &WavefrontSlab,
@@ -325,6 +335,7 @@ fn bt_affine_ins1_ext(
 }
 
 /// Affine backtrace: look up M→D1 open at (score, k+1), offset unchanged.
+#[inline(always)]
 fn bt_affine_del1_open(
     wf_components: &WavefrontComponents,
     slab: &WavefrontSlab,
@@ -347,6 +358,7 @@ fn bt_affine_del1_open(
 }
 
 /// Affine backtrace: look up D1 extend at (score, k+1), offset unchanged.
+#[inline(always)]
 fn bt_affine_del1_ext(
     wf_components: &WavefrontComponents,
     slab: &WavefrontSlab,
@@ -575,6 +587,7 @@ pub fn backtrace_affine(
 // --- Affine2p backtrace helpers ---
 
 /// Look up I2-wavefront at (score, k): returns piggyback(offset, BT_I2_EXT).
+#[inline(always)]
 fn bt_i2_ext(wf_components: &WavefrontComponents, slab: &WavefrontSlab, score: i32, k: i32) -> i64 {
     if score < 0 {
         return OFFSET_NULL as i64;
@@ -592,6 +605,7 @@ fn bt_i2_ext(wf_components: &WavefrontComponents, slab: &WavefrontSlab, score: i
 }
 
 /// Look up D2-wavefront at (score, k): returns piggyback(offset, BT_D2_EXT).
+#[inline(always)]
 fn bt_d2_ext(wf_components: &WavefrontComponents, slab: &WavefrontSlab, score: i32, k: i32) -> i64 {
     if score < 0 {
         return OFFSET_NULL as i64;
@@ -609,6 +623,7 @@ fn bt_d2_ext(wf_components: &WavefrontComponents, slab: &WavefrontSlab, score: i
 }
 
 /// Affine2p backtrace: look up M→I2 open at (score, k-1), offset + 1.
+#[inline(always)]
 fn bt_affine_ins2_open(
     wf_components: &WavefrontComponents,
     slab: &WavefrontSlab,
@@ -631,6 +646,7 @@ fn bt_affine_ins2_open(
 }
 
 /// Affine2p backtrace: look up I2 extend at (score, k-1), offset + 1.
+#[inline(always)]
 fn bt_affine_ins2_ext(
     wf_components: &WavefrontComponents,
     slab: &WavefrontSlab,
@@ -653,6 +669,7 @@ fn bt_affine_ins2_ext(
 }
 
 /// Affine2p backtrace: look up M→D2 open at (score, k+1), offset unchanged.
+#[inline(always)]
 fn bt_affine_del2_open(
     wf_components: &WavefrontComponents,
     slab: &WavefrontSlab,
@@ -675,6 +692,7 @@ fn bt_affine_del2_open(
 }
 
 /// Affine2p backtrace: look up D2 extend at (score, k+1), offset unchanged.
+#[inline(always)]
 fn bt_affine_del2_ext(
     wf_components: &WavefrontComponents,
     slab: &WavefrontSlab,

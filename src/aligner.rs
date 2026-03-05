@@ -411,6 +411,18 @@ impl WavefrontAligner {
         // Clear slab
         self.wavefront_slab.clear();
 
+        // Pre-size slab for CIGAR mode to avoid Vec reallocations
+        if !score_only {
+            let num_types = match self.penalties.distance_metric {
+                DistanceMetric::Edit | DistanceMetric::Indel => 1,
+                DistanceMetric::GapLinear => 1,
+                DistanceMetric::GapAffine => 3,
+                DistanceMetric::GapAffine2p => 5,
+            };
+            self.wavefront_slab
+                .reserve(self.wf_components.num_wavefronts * num_types);
+        }
+
         // Reset state
         self.num_null_steps = 0;
         self.status = AlignStatus::Ok;
@@ -1108,6 +1120,9 @@ impl WavefrontAligner {
         update_lohi!(d2_ext_idx, -1, -1);
 
         if lo > hi {
+            if self.wf_components.memory_modular {
+                self.free_output_wavefronts_affine2p(score_curr);
+            }
             return;
         }
 
@@ -1118,6 +1133,9 @@ impl WavefrontAligner {
         hi = hi.min(hist_hi - 1);
 
         if lo > hi {
+            if self.wf_components.memory_modular {
+                self.free_output_wavefronts_affine2p(score_curr);
+            }
             return;
         }
 
@@ -1810,6 +1828,18 @@ impl WavefrontAligner {
         self.wf_components.resize(plen, tlen, &self.penalties);
         self.wavefront_slab.clear();
 
+        // Pre-size slab for CIGAR mode (BiWFA always needs full wavefronts)
+        if !self.wf_components.memory_modular {
+            let num_types = match self.penalties.distance_metric {
+                DistanceMetric::Edit | DistanceMetric::Indel => 1,
+                DistanceMetric::GapLinear => 1,
+                DistanceMetric::GapAffine => 3,
+                DistanceMetric::GapAffine2p => 5,
+            };
+            self.wavefront_slab
+                .reserve(self.wf_components.num_wavefronts * num_types);
+        }
+
         self.num_null_steps = 0;
         self.status = AlignStatus::Ok;
         self.alignment_end_pos = WavefrontPos::default();
@@ -1898,6 +1928,34 @@ impl WavefrontAligner {
         self.wf_components.set_d1_idx(score, WAVEFRONT_IDX_NONE);
     }
 
+    fn free_output_wavefronts_affine2p(&mut self, score: usize) {
+        let score_mod = score % self.wf_components.max_score_scope;
+        let old_m = self.wf_components.get_m_idx(score_mod);
+        if old_m != WAVEFRONT_IDX_NONE {
+            self.wavefront_slab.free(old_m);
+        }
+        let old_i1 = self.wf_components.get_i1_idx(score_mod);
+        if old_i1 != WAVEFRONT_IDX_NONE {
+            self.wavefront_slab.free(old_i1);
+        }
+        let old_d1 = self.wf_components.get_d1_idx(score_mod);
+        if old_d1 != WAVEFRONT_IDX_NONE {
+            self.wavefront_slab.free(old_d1);
+        }
+        let old_i2 = self.wf_components.get_i2_idx(score_mod);
+        if old_i2 != WAVEFRONT_IDX_NONE {
+            self.wavefront_slab.free(old_i2);
+        }
+        let old_d2 = self.wf_components.get_d2_idx(score_mod);
+        if old_d2 != WAVEFRONT_IDX_NONE {
+            self.wavefront_slab.free(old_d2);
+        }
+        self.wf_components.set_m_idx(score, WAVEFRONT_IDX_NONE);
+        self.wf_components.set_i1_idx(score, WAVEFRONT_IDX_NONE);
+        self.wf_components.set_d1_idx(score, WAVEFRONT_IDX_NONE);
+        self.wf_components.set_i2_idx(score, WAVEFRONT_IDX_NONE);
+        self.wf_components.set_d2_idx(score, WAVEFRONT_IDX_NONE);
+    }
 
     /// Dispatch compute step based on distance metric.
     fn compute_step(&mut self, score: i32) {

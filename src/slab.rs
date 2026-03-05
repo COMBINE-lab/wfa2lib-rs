@@ -49,8 +49,9 @@ pub struct WavefrontSlab {
 impl WavefrontSlab {
     /// Create a new slab.
     pub fn new(init_wf_length: i32, allocate_backtrace: bool, slab_mode: SlabMode) -> Self {
-        // Initial arena: enough for ~50 wavefronts at init size.
-        let arena_capacity = (init_wf_length as usize) * 50;
+        // Initial arena: enough for ~500 wavefronts at init size.
+        // Large initial chunk avoids chunk splits in CIGAR mode.
+        let arena_capacity = (init_wf_length as usize) * 500;
         Self {
             allocate_backtrace,
             slab_mode,
@@ -61,6 +62,11 @@ impl WavefrontSlab {
             memory_used: 0,
             arena: OffsetArena::new(arena_capacity.max(4096)),
         }
+    }
+
+    /// Pre-allocate capacity for the wavefronts Vec to avoid reallocations.
+    pub fn reserve(&mut self, num_wavefronts: usize) {
+        self.wavefronts.reserve(num_wavefronts);
     }
 
     /// Get the slab mode.
