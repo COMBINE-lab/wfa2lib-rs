@@ -1,0 +1,142 @@
+# wfa2lib-rs
+
+**A pure Rust port of [WFA2-lib](https://github.com/smarco/WFA2-lib)**, the wavefront alignment library for pairwise sequence alignment.
+
+This project was created with [Claude Code](https://claude.ai/claude-code).
+
+## Overview
+
+wfa2lib-rs is a from-scratch Rust implementation of the Wavefront Alignment (WFA) algorithm. WFA exploits the structure of sequence similarity to achieve O(ns) time complexity — proportional to the sequence length (n) and the alignment score (s) — making it significantly faster than traditional O(n²) dynamic programming approaches for similar sequences.
+
+This implementation covers the full WFA feature set:
+
+- **Distance metrics**: indel (LCS), edit (Levenshtein), gap-linear (Needleman-Wunsch), gap-affine (Smith-Waterman-Gotoh), and gap-affine 2-piece (concave penalties)
+- **Alignment modes**: end-to-end (global), ends-free (semi-global), and extension alignment
+- **BiWFA**: bidirectional WFA for O(s) memory alignment with full CIGAR output
+- **Heuristics**: WF-adaptive, X-drop, Z-drop, static banding, and adaptive banding for pruning divergent sequences
+- **Sequence representations**: ASCII byte sequences, packed 2-bit DNA encoding, and a lambda callback interface for custom sequence access
+- **SIMD acceleration**: NEON-vectorized compute kernels on aarch64 (4 diagonals per iteration) with scalar fallback on other architectures
+- **Score and alignment**: score-only mode for speed, or full CIGAR traceback with support for match rewards via Eizenga's formula
+
+## Performance
+
+Benchmarked against the C reference implementation (WFA2-lib) on Apple Silicon (M-series):
+
+| Benchmark | Ratio vs C |
+|---|---|
+| Edit distance | 1.49x |
+| Gap-affine (CIGAR) | 1.34x |
+| Gap-affine (score-only) | 1.27x |
+| BiWFA | 1.33x |
+
+The compute and extend kernels are at or near parity with C. The remaining gap is primarily due to allocator overhead (C uses a bump/arena allocator vs. individual `Vec` allocations in Rust).
+
+## Building
+
+Requires Rust 1.91+ (edition 2024).
+
+```bash
+# Debug build
+cargo build
+
+# Optimized release build (recommended)
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+
+# Run tests (215 tests: 197 unit + 18 integration)
+cargo test
+```
+
+## Usage
+
+### As a library
+
+```rust
+use wfa2lib_rs::aligner::{AlignmentScope, WavefrontAligner};
+use wfa2lib_rs::penalties::{AffinePenalties, DistanceMetric, WavefrontPenalties};
+
+// Configure gap-affine penalties (mismatch=4, gap_open=6, gap_extend=2)
+let penalties = WavefrontPenalties::new_affine(AffinePenalties {
+    match_: 0,
+    mismatch: 4,
+    gap_opening: 6,
+    gap_extension: 2,
+});
+
+let mut aligner = WavefrontAligner::new(penalties);
+aligner.alignment_scope = AlignmentScope::ComputeAlignment;
+
+let pattern = b"TCTTTACTCGCGCGTTGGAGAAATACAATAGT";
+let text    = b"TCTATACTGCGCGTTTGGAGAAATAAAATAGT";
+
+let score = aligner.align_end2end(pattern, text);
+println!("Score: {}", score);
+println!("CIGAR: {}", aligner.cigar);
+```
+
+### CLI benchmark tool
+
+The included `align_benchmark` binary is compatible with the WFA2-lib reference interface:
+
+```bash
+# Gap-affine alignment
+cargo run --release --bin align_benchmark -- \
+    -a gap-affine-wfa \
+    -g 0,4,6,2 \
+    -i sequences.seq
+
+# BiWFA (memory-efficient)
+cargo run --release --bin align_benchmark -- \
+    -a gap-affine-wfa \
+    -g 0,4,6,2 \
+    --wfa-memory ultralow \
+    -i sequences.seq
+
+# Score-only mode
+cargo run --release --bin align_benchmark -- \
+    -a gap-affine-wfa \
+    -g 0,4,6,2 \
+    --wfa-score-only \
+    -i sequences.seq
+```
+
+Input files use the WFA2-lib format: one alignment pair per line, with pattern and text separated by a `>` character.
+
+## Project structure
+
+```
+src/
+  lib.rs              # Public module exports
+  aligner.rs          # Main WavefrontAligner struct and alignment loops
+  penalties.rs        # Distance metrics and penalty configurations
+  sequences.rs        # Sequence representations (ASCII, packed 2-bit, lambda)
+  wavefront.rs        # Wavefront data structure
+  wavefront_set.rs    # Grouped wavefront sets (M, I, D components)
+  slab.rs             # Wavefront memory pool
+  compute/            # WFA compute kernels (edit, linear, affine, affine2p)
+  extend.rs           # Wavefront extend with SIMD acceleration
+  backtrace.rs        # CIGAR traceback from wavefronts
+  bialign.rs          # Bidirectional WFA (BiWFA)
+  cigar.rs            # CIGAR operations and scoring
+  heuristic.rs        # Pruning heuristics
+  offset.rs           # Wavefront offset type and coordinate helpers
+  pcigar.rs           # Packed CIGAR for BiWFA backtrace
+  bt_buffer.rs        # Backtrace buffer for BiWFA
+  components.rs       # Wavefront component management
+  termination.rs      # Alignment termination conditions
+  bin/
+    align_benchmark.rs  # CLI binary
+```
+
+## License
+
+BSD 3-Clause. See [LICENSE](LICENSE).
+
+## Citations
+
+If you use this software, please cite the original WFA papers:
+
+**WFA — Wavefront Alignment**:
+> Santiago Marco-Sola, Juan Carlos Moure, Miquel Moreto, Antonio Espinosa. "Fast gap-affine pairwise alignment using the wavefront algorithm." *Bioinformatics*, Volume 37, Issue 4, February 2021, Pages 456–463. https://doi.org/10.1093/bioinformatics/btaa777
+
+**BiWFA — Bidirectional WFA**:
+> Santiago Marco-Sola, Jordan M Eizenga, Andrea Guarracino, Benedict Paten, Erik Garrison, Miquel Moreto. "Optimal gap-affine alignment in O(s) space." *Bioinformatics*, Volume 39, Issue 2, February 2023, btad074. https://doi.org/10.1093/bioinformatics/btad074
