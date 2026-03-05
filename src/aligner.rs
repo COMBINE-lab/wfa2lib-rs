@@ -683,15 +683,15 @@ impl WavefrontAligner {
             wf_prev.init_ends_lower(lo - 1);
         }
 
-        // Free old wavefronts at modular slot
-        if self.wf_components.memory_modular {
-            self.free_output_wavefronts_m(score_curr);
-        }
-
-        // Allocate output wavefront using historic bounds
+        // Allocate or reuse output wavefront
         let hist_lo = self.wf_components.historic_min_lo;
         let hist_hi = self.wf_components.historic_max_hi;
-        let curr_idx = self.wavefront_slab.allocate(hist_lo, hist_hi);
+        let curr_idx = if self.wf_components.memory_modular {
+            let old_idx = self.wf_components.get_m_idx(score_curr);
+            self.wavefront_slab.reuse_or_allocate(old_idx, hist_lo, hist_hi)
+        } else {
+            self.wavefront_slab.allocate(hist_lo, hist_hi)
+        };
         {
             let wf_curr = self.wavefront_slab.get_mut(curr_idx);
             wf_curr.set_limits(lo, hi);
@@ -787,15 +787,15 @@ impl WavefrontAligner {
         }
         let use_misms_idx = misms_idx;
 
-        // Free old wavefronts at modular slot
-        if self.wf_components.memory_modular {
-            self.free_output_wavefronts_m(score_curr);
-        }
-
-        // Allocate output wavefront using historic bounds
+        // Allocate or reuse output wavefront
         let hist_lo = self.wf_components.historic_min_lo;
         let hist_hi = self.wf_components.historic_max_hi;
-        let curr_idx = self.wavefront_slab.allocate(hist_lo, hist_hi);
+        let curr_idx = if self.wf_components.memory_modular {
+            let old_idx = self.wf_components.get_m_idx(score_curr);
+            self.wavefront_slab.reuse_or_allocate(old_idx, hist_lo, hist_hi)
+        } else {
+            self.wavefront_slab.allocate(hist_lo, hist_hi)
+        };
         {
             let wf_curr = self.wavefront_slab.get_mut(curr_idx);
             wf_curr.set_limits(lo, hi);
@@ -882,23 +882,19 @@ impl WavefrontAligner {
         let mut lo = i32::MAX;
         let mut hi = i32::MIN;
 
-        // Each input contributes output diagonals based on how the kernel reads it:
-        // - m_misms: read at k → output [lo, hi]
-        // - m_open: read at k-1 and k+1 → output [lo-1, hi+1]
-        // - i1_ext: read at k-1 → output [lo+1, hi+1]
-        // - d1_ext: read at k+1 → output [lo-1, hi-1]
-        for (idx, lo_delta, hi_delta) in [
-            (m_misms_idx, 0, 0),
-            (m_open_idx, -1, 1),
-            (i1_ext_idx, 1, 1),
-            (d1_ext_idx, -1, -1),
-        ] {
-            if idx != WAVEFRONT_IDX_NONE {
-                let wf = self.wavefront_slab.get(idx);
-                lo = lo.min(wf.lo + lo_delta);
-                hi = hi.max(wf.hi + hi_delta);
-            }
+        macro_rules! update_lohi {
+            ($idx:expr, $lo_d:expr, $hi_d:expr) => {
+                if $idx != WAVEFRONT_IDX_NONE {
+                    let wf = self.wavefront_slab.get($idx);
+                    lo = lo.min(wf.lo + $lo_d);
+                    hi = hi.max(wf.hi + $hi_d);
+                }
+            };
         }
+        update_lohi!(m_misms_idx, 0, 0);
+        update_lohi!(m_open_idx, -1, 1);
+        update_lohi!(i1_ext_idx, 1, 1);
+        update_lohi!(d1_ext_idx, -1, -1);
 
         if lo > hi {
             // No valid inputs — free old modular slot and set to none
@@ -946,17 +942,25 @@ impl WavefrontAligner {
             wf.init_ends_lower(lo);
         }
 
-        // Free old wavefronts at modular slot
-        if self.wf_components.memory_modular {
-            self.free_output_wavefronts_affine(score_curr);
-        }
-
-        // Allocate 3 output wavefronts using historic bounds
+        // Allocate or reuse 3 output wavefronts
         let hist_lo = self.wf_components.historic_min_lo;
         let hist_hi = self.wf_components.historic_max_hi;
-        let m_curr_idx = self.wavefront_slab.allocate(hist_lo, hist_hi);
-        let i1_curr_idx = self.wavefront_slab.allocate(hist_lo, hist_hi);
-        let d1_curr_idx = self.wavefront_slab.allocate(hist_lo, hist_hi);
+        let (m_curr_idx, i1_curr_idx, d1_curr_idx) = if self.wf_components.memory_modular {
+            let old_m = self.wf_components.get_m_idx(score_curr);
+            let old_i1 = self.wf_components.get_i1_idx(score_curr);
+            let old_d1 = self.wf_components.get_d1_idx(score_curr);
+            (
+                self.wavefront_slab.reuse_or_allocate(old_m, hist_lo, hist_hi),
+                self.wavefront_slab.reuse_or_allocate(old_i1, hist_lo, hist_hi),
+                self.wavefront_slab.reuse_or_allocate(old_d1, hist_lo, hist_hi),
+            )
+        } else {
+            (
+                self.wavefront_slab.allocate(hist_lo, hist_hi),
+                self.wavefront_slab.allocate(hist_lo, hist_hi),
+                self.wavefront_slab.allocate(hist_lo, hist_hi),
+            )
+        };
 
         {
             let wf = self.wavefront_slab.get_mut(m_curr_idx);
@@ -1020,16 +1024,10 @@ impl WavefrontAligner {
         self.wf_components.set_i1_idx(score_curr, i1_curr_idx);
         self.wf_components.set_d1_idx(score_curr, d1_curr_idx);
 
-        // Trim ends on ALL output wavefronts (matching C's wavefront_compute_process_ends).
-        // This prevents un-trimmed I1/D1 ranges from inflating subsequent steps' [lo,hi].
-        {
-            let wf = self.wavefront_slab.get_mut(i1_curr_idx);
-            compute::trim_ends(plen, tlen, wf);
-        }
-        {
-            let wf = self.wavefront_slab.get_mut(d1_curr_idx);
-            compute::trim_ends(plen, tlen, wf);
-        }
+        // Trim ends on M wavefront to detect null steps.
+        // I1/D1 don't need trimming: the NEON/scalar kernel already clamps
+        // out-of-bounds M offsets to OFFSET_NULL. I1/D1 values are only read
+        // at k±1 (within allocated range) and never used for termination.
         {
             let wf_curr = self.wavefront_slab.get_mut(m_curr_idx);
             compute::trim_ends(plen, tlen, wf_curr);
@@ -1092,21 +1090,22 @@ impl WavefrontAligner {
         let mut lo = i32::MAX;
         let mut hi = i32::MIN;
 
-        for (idx, lo_delta, hi_delta) in [
-            (m_misms_idx, 0, 0),
-            (m_open1_idx, -1, 1),
-            (m_open2_idx, -1, 1),
-            (i1_ext_idx, 1, 1),
-            (i2_ext_idx, 1, 1),
-            (d1_ext_idx, -1, -1),
-            (d2_ext_idx, -1, -1),
-        ] {
-            if idx != WAVEFRONT_IDX_NONE {
-                let wf = self.wavefront_slab.get(idx);
-                lo = lo.min(wf.lo + lo_delta);
-                hi = hi.max(wf.hi + hi_delta);
-            }
+        macro_rules! update_lohi {
+            ($idx:expr, $lo_d:expr, $hi_d:expr) => {
+                if $idx != WAVEFRONT_IDX_NONE {
+                    let wf = self.wavefront_slab.get($idx);
+                    lo = lo.min(wf.lo + $lo_d);
+                    hi = hi.max(wf.hi + $hi_d);
+                }
+            };
         }
+        update_lohi!(m_misms_idx, 0, 0);
+        update_lohi!(m_open1_idx, -1, 1);
+        update_lohi!(m_open2_idx, -1, 1);
+        update_lohi!(i1_ext_idx, 1, 1);
+        update_lohi!(i2_ext_idx, 1, 1);
+        update_lohi!(d1_ext_idx, -1, -1);
+        update_lohi!(d2_ext_idx, -1, -1);
 
         if lo > hi {
             return;
@@ -1169,17 +1168,30 @@ impl WavefrontAligner {
             wf.init_ends_lower(lo);
         }
 
-        // Free old wavefronts at modular slot
-        if self.wf_components.memory_modular {
-            self.free_output_wavefronts_affine2p(score_curr);
-        }
-
-        // Allocate 5 output wavefronts using historic bounds
-        let m_curr_idx = self.wavefront_slab.allocate(hist_lo, hist_hi);
-        let i1_curr_idx = self.wavefront_slab.allocate(hist_lo, hist_hi);
-        let i2_curr_idx = self.wavefront_slab.allocate(hist_lo, hist_hi);
-        let d1_curr_idx = self.wavefront_slab.allocate(hist_lo, hist_hi);
-        let d2_curr_idx = self.wavefront_slab.allocate(hist_lo, hist_hi);
+        // Allocate or reuse 5 output wavefronts
+        let (m_curr_idx, i1_curr_idx, i2_curr_idx, d1_curr_idx, d2_curr_idx) =
+            if self.wf_components.memory_modular {
+                let old_m = self.wf_components.get_m_idx(score_curr);
+                let old_i1 = self.wf_components.get_i1_idx(score_curr);
+                let old_i2 = self.wf_components.get_i2_idx(score_curr);
+                let old_d1 = self.wf_components.get_d1_idx(score_curr);
+                let old_d2 = self.wf_components.get_d2_idx(score_curr);
+                (
+                    self.wavefront_slab.reuse_or_allocate(old_m, hist_lo, hist_hi),
+                    self.wavefront_slab.reuse_or_allocate(old_i1, hist_lo, hist_hi),
+                    self.wavefront_slab.reuse_or_allocate(old_i2, hist_lo, hist_hi),
+                    self.wavefront_slab.reuse_or_allocate(old_d1, hist_lo, hist_hi),
+                    self.wavefront_slab.reuse_or_allocate(old_d2, hist_lo, hist_hi),
+                )
+            } else {
+                (
+                    self.wavefront_slab.allocate(hist_lo, hist_hi),
+                    self.wavefront_slab.allocate(hist_lo, hist_hi),
+                    self.wavefront_slab.allocate(hist_lo, hist_hi),
+                    self.wavefront_slab.allocate(hist_lo, hist_hi),
+                    self.wavefront_slab.allocate(hist_lo, hist_hi),
+                )
+            };
 
         {
             let wf = self.wavefront_slab.get_mut(m_curr_idx);
@@ -1275,23 +1287,7 @@ impl WavefrontAligner {
         self.wf_components.set_d1_idx(score_curr, d1_curr_idx);
         self.wf_components.set_d2_idx(score_curr, d2_curr_idx);
 
-        // Trim ends on ALL output wavefronts
-        {
-            let wf = self.wavefront_slab.get_mut(i1_curr_idx);
-            compute::trim_ends(plen, tlen, wf);
-        }
-        {
-            let wf = self.wavefront_slab.get_mut(i2_curr_idx);
-            compute::trim_ends(plen, tlen, wf);
-        }
-        {
-            let wf = self.wavefront_slab.get_mut(d1_curr_idx);
-            compute::trim_ends(plen, tlen, wf);
-        }
-        {
-            let wf = self.wavefront_slab.get_mut(d2_curr_idx);
-            compute::trim_ends(plen, tlen, wf);
-        }
+        // Trim ends on M wavefront only
         {
             let wf_curr = self.wavefront_slab.get_mut(m_curr_idx);
             compute::trim_ends(plen, tlen, wf_curr);
@@ -1882,16 +1878,6 @@ impl WavefrontAligner {
         }
     }
 
-    /// Free old wavefronts at the modular slot for edit/indel/linear (M only).
-    fn free_output_wavefronts_m(&mut self, score: usize) {
-        let score_mod = score % self.wf_components.max_score_scope;
-        let old_m = self.wf_components.get_m_idx(score_mod);
-        if old_m != WAVEFRONT_IDX_NONE {
-            self.wavefront_slab.free(old_m);
-        }
-        self.wf_components.set_m_idx(score, WAVEFRONT_IDX_NONE);
-    }
-
     /// Free old wavefronts at the modular slot for affine (M, I1, D1).
     fn free_output_wavefronts_affine(&mut self, score: usize) {
         let score_mod = score % self.wf_components.max_score_scope;
@@ -1912,35 +1898,6 @@ impl WavefrontAligner {
         self.wf_components.set_d1_idx(score, WAVEFRONT_IDX_NONE);
     }
 
-    /// Free old wavefronts at the modular slot for affine2p (M, I1, D1, I2, D2).
-    fn free_output_wavefronts_affine2p(&mut self, score: usize) {
-        let score_mod = score % self.wf_components.max_score_scope;
-        let old_m = self.wf_components.get_m_idx(score_mod);
-        if old_m != WAVEFRONT_IDX_NONE {
-            self.wavefront_slab.free(old_m);
-        }
-        let old_i1 = self.wf_components.get_i1_idx(score_mod);
-        if old_i1 != WAVEFRONT_IDX_NONE {
-            self.wavefront_slab.free(old_i1);
-        }
-        let old_d1 = self.wf_components.get_d1_idx(score_mod);
-        if old_d1 != WAVEFRONT_IDX_NONE {
-            self.wavefront_slab.free(old_d1);
-        }
-        let old_i2 = self.wf_components.get_i2_idx(score_mod);
-        if old_i2 != WAVEFRONT_IDX_NONE {
-            self.wavefront_slab.free(old_i2);
-        }
-        let old_d2 = self.wf_components.get_d2_idx(score_mod);
-        if old_d2 != WAVEFRONT_IDX_NONE {
-            self.wavefront_slab.free(old_d2);
-        }
-        self.wf_components.set_m_idx(score, WAVEFRONT_IDX_NONE);
-        self.wf_components.set_i1_idx(score, WAVEFRONT_IDX_NONE);
-        self.wf_components.set_d1_idx(score, WAVEFRONT_IDX_NONE);
-        self.wf_components.set_i2_idx(score, WAVEFRONT_IDX_NONE);
-        self.wf_components.set_d2_idx(score, WAVEFRONT_IDX_NONE);
-    }
 
     /// Dispatch compute step based on distance metric.
     fn compute_step(&mut self, score: i32) {

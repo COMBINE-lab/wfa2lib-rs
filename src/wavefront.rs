@@ -1,8 +1,13 @@
 //! Individual wavefront data structure.
 //!
 //! A wavefront stores offsets along a range of diagonals [lo, hi].
-//! Offsets are k-centered: internally stored in a Vec but accessed
+//! Offsets are k-centered: internally stored in a raw buffer but accessed
 //! via diagonal index `k` using a base offset.
+//!
+//! Uses raw pointers instead of `Vec` to minimize struct size (56 bytes)
+//! for better cache utilization when accessing many wavefronts per step.
+
+use std::alloc::{Layout, alloc, alloc_zeroed, dealloc};
 
 use crate::offset::{OFFSET_NULL, WfOffset};
 use crate::pcigar::{PCIGAR_NULL, Pcigar};
@@ -30,42 +35,64 @@ pub enum WavefrontStatus {
 }
 
 /// A single wavefront storing offsets for diagonals [lo, hi].
+///
+/// Layout is optimized for cache: ~56 bytes fits in a single cache line.
+/// Raw pointers replace `Vec`/`Option<Vec>` to eliminate fat-pointer overhead.
 pub struct Wavefront {
+    // Pointers first (8-byte aligned)
+    /// Raw offset storage buffer.
+    offsets_ptr: *mut WfOffset,
+    /// Backtrace pcigar values (null if no backtrace).
+    bt_pcigar_ptr: *mut Pcigar,
+    /// Backtrace previous-index values (null if no backtrace).
+    bt_prev_ptr: *mut BtBlockIdx,
+
     // Dimensions
-    /// Whether this is a null (empty/sentinel) wavefront.
-    pub null: bool,
     /// Lowest diagonal (inclusive).
     pub lo: i32,
     /// Highest diagonal (inclusive).
     pub hi: i32,
-
-    // Wavefront elements (k-centered storage)
-    /// The raw offset storage.
-    offsets_mem: Vec<WfOffset>,
-    /// The k-value corresponding to offsets_mem[0].
+    /// The k-value corresponding to offsets_ptr[0].
     base_k: i32,
 
-    // Piggyback backtrace
-    /// Maximum pcigar-ops stored in any backtrace block.
-    pub bt_occupancy_max: i32,
-    /// Backtrace pcigar values (k-centered, parallel to offsets).
-    bt_pcigar_mem: Option<Vec<Pcigar>>,
-    /// Backtrace previous-index values (k-centered, parallel to offsets).
-    bt_prev_mem: Option<Vec<BtBlockIdx>>,
-
-    // Slab internals
-    /// Memory state of this wavefront.
-    pub status: WavefrontStatus,
+    // Slab/metadata
     /// Total elements allocated (max wavefront size).
     pub wf_elements_allocated: i32,
-    /// Minimum diagonal element allocated.
-    pub wf_elements_allocated_min: i32,
-    /// Maximum diagonal element allocated.
-    pub wf_elements_allocated_max: i32,
     /// Minimum diagonal element initialized (inclusive).
     pub wf_elements_init_min: i32,
     /// Maximum diagonal element initialized (inclusive).
     pub wf_elements_init_max: i32,
+    /// Maximum pcigar-ops stored in any backtrace block.
+    pub bt_occupancy_max: i32,
+
+    /// Whether this is a null (empty/sentinel) wavefront.
+    pub null: bool,
+    /// Memory state of this wavefront.
+    pub status: WavefrontStatus,
+}
+
+// Raw pointers are not Send/Sync by default, but our wavefronts are
+// single-owner (never shared across threads).
+unsafe impl Send for Wavefront {}
+
+impl Drop for Wavefront {
+    fn drop(&mut self) {
+        let size = self.wf_elements_allocated as usize;
+        if size > 0 && !self.offsets_ptr.is_null() {
+            unsafe {
+                let layout = Layout::array::<WfOffset>(size).unwrap();
+                dealloc(self.offsets_ptr as *mut u8, layout);
+            }
+        }
+        if !self.bt_pcigar_ptr.is_null() {
+            unsafe {
+                let layout = Layout::array::<Pcigar>(size).unwrap();
+                dealloc(self.bt_pcigar_ptr as *mut u8, layout);
+                let layout = Layout::array::<BtBlockIdx>(size).unwrap();
+                dealloc(self.bt_prev_ptr as *mut u8, layout);
+            }
+        }
+    }
 }
 
 impl Wavefront {
@@ -76,55 +103,59 @@ impl Wavefront {
     /// ensure all positions are written (by compute kernels) or filled (by
     /// `init_null`/`init_ends_lower`/`init_ends_higher`) before being read.
     /// The slab allocator + compute pipeline guarantee this invariant.
-    #[allow(clippy::uninit_vec)]
     pub fn allocate(wf_elements_allocated: i32, allocate_backtrace: bool) -> Self {
         let size = wf_elements_allocated as usize;
-        // bt_pcigar (PCIGAR_NULL=0) and bt_prev (0) use calloc-optimized zero init.
-        let bt_pcigar_mem = if allocate_backtrace {
-            Some(vec![PCIGAR_NULL; size])
-        } else {
-            None
+        // SAFETY: offsets buffer is not read until init_null/init_ends fills
+        // the relevant range, or the compute kernel writes every position.
+        let offsets_ptr = unsafe {
+            let layout = Layout::array::<WfOffset>(size).unwrap();
+            alloc(layout) as *mut WfOffset
         };
-        let bt_prev_mem = if allocate_backtrace {
-            Some(vec![0u32; size])
+        // bt_pcigar (PCIGAR_NULL=0) and bt_prev (0) use zero-init.
+        let (bt_pcigar_ptr, bt_prev_ptr) = if allocate_backtrace {
+            unsafe {
+                let p = alloc_zeroed(Layout::array::<Pcigar>(size).unwrap()) as *mut Pcigar;
+                let b = alloc_zeroed(Layout::array::<BtBlockIdx>(size).unwrap()) as *mut BtBlockIdx;
+                (p, b)
+            }
         } else {
-            None
+            (std::ptr::null_mut(), std::ptr::null_mut())
         };
-        // SAFETY: offsets_mem is not read until init_null/init_ends fills the
-        // relevant range, or the compute kernel writes every position in [lo,hi].
-        // Reused wavefronts from the slab free list also skip this fill.
-        let mut offsets_mem = Vec::with_capacity(size);
-        unsafe { offsets_mem.set_len(size); }
         Self {
+            offsets_ptr,
+            bt_pcigar_ptr,
+            bt_prev_ptr,
             null: false,
             lo: 1,
             hi: -1,
-            offsets_mem,
             base_k: 0,
             bt_occupancy_max: 0,
-            bt_pcigar_mem,
-            bt_prev_mem,
             status: WavefrontStatus::Free,
             wf_elements_allocated,
-            wf_elements_allocated_min: 0,
-            wf_elements_allocated_max: 0,
             wf_elements_init_min: 0,
             wf_elements_init_max: 0,
         }
     }
 
     /// Resize the wavefront (content is lost).
-    #[allow(clippy::uninit_vec)]
     pub fn resize(&mut self, wf_elements_allocated: i32) {
-        let size = wf_elements_allocated as usize;
+        let old_size = self.wf_elements_allocated as usize;
+        let new_size = wf_elements_allocated as usize;
         self.wf_elements_allocated = wf_elements_allocated;
-        // SAFETY: same invariant as allocate — offsets filled before read.
-        let mut offsets_mem = Vec::with_capacity(size);
-        unsafe { offsets_mem.set_len(size); }
-        self.offsets_mem = offsets_mem;
-        if let Some(ref mut bt_pcigar) = self.bt_pcigar_mem {
-            *bt_pcigar = vec![PCIGAR_NULL; size];
-            *self.bt_prev_mem.as_mut().unwrap() = vec![0u32; size];
+        unsafe {
+            // Free old offsets
+            if old_size > 0 && !self.offsets_ptr.is_null() {
+                dealloc(self.offsets_ptr as *mut u8, Layout::array::<WfOffset>(old_size).unwrap());
+            }
+            // Allocate new offsets (uninitialized)
+            self.offsets_ptr = alloc(Layout::array::<WfOffset>(new_size).unwrap()) as *mut WfOffset;
+            // Resize backtrace if present
+            if !self.bt_pcigar_ptr.is_null() {
+                dealloc(self.bt_pcigar_ptr as *mut u8, Layout::array::<Pcigar>(old_size).unwrap());
+                dealloc(self.bt_prev_ptr as *mut u8, Layout::array::<BtBlockIdx>(old_size).unwrap());
+                self.bt_pcigar_ptr = alloc_zeroed(Layout::array::<Pcigar>(new_size).unwrap()) as *mut Pcigar;
+                self.bt_prev_ptr = alloc_zeroed(Layout::array::<BtBlockIdx>(new_size).unwrap()) as *mut BtBlockIdx;
+            }
         }
     }
 
@@ -136,18 +167,16 @@ impl Wavefront {
         self.lo = 1;
         self.hi = -1;
         self.base_k = min_lo;
-        if self.bt_pcigar_mem.is_some() {
+        if !self.bt_pcigar_ptr.is_null() {
             self.bt_occupancy_max = 0;
         }
-        self.wf_elements_allocated_min = min_lo;
-        self.wf_elements_allocated_max = min_lo + self.wf_elements_allocated - 1;
         self.wf_elements_init_min = 0;
         self.wf_elements_init_max = 0;
         debug_assert!(
-            max_hi <= self.wf_elements_allocated_max,
+            max_hi <= min_lo + self.wf_elements_allocated - 1,
             "max_hi={} exceeds allocated_max={} (base_k={}, alloc={})",
             max_hi,
-            self.wf_elements_allocated_max,
+            min_lo + self.wf_elements_allocated - 1,
             self.base_k,
             self.wf_elements_allocated
         );
@@ -160,14 +189,17 @@ impl Wavefront {
         self.hi = -1;
         self.base_k = min_lo;
         let wf_elements = (max_hi - min_lo + 1) as usize;
-        self.offsets_mem[..wf_elements].fill(OFFSET_NULL);
-        if let Some(ref mut bt_pcigar) = self.bt_pcigar_mem {
-            self.bt_occupancy_max = 0;
-            bt_pcigar[..wf_elements].fill(PCIGAR_NULL);
-            self.bt_prev_mem.as_mut().unwrap()[..wf_elements].fill(0);
+        unsafe {
+            let slice = std::slice::from_raw_parts_mut(self.offsets_ptr, wf_elements);
+            slice.fill(OFFSET_NULL);
+            if !self.bt_pcigar_ptr.is_null() {
+                self.bt_occupancy_max = 0;
+                let pcigar_slice = std::slice::from_raw_parts_mut(self.bt_pcigar_ptr, wf_elements);
+                pcigar_slice.fill(PCIGAR_NULL);
+                let prev_slice = std::slice::from_raw_parts_mut(self.bt_prev_ptr, wf_elements);
+                prev_slice.fill(0);
+            }
         }
-        self.wf_elements_allocated_min = min_lo;
-        self.wf_elements_allocated_max = min_lo + self.wf_elements_allocated - 1;
         self.wf_elements_init_min = min_lo;
         self.wf_elements_init_max = max_hi;
     }
@@ -189,30 +221,40 @@ impl Wavefront {
     /// Extend the initialized range downward to `min_lo`.
     /// Fills positions [min_lo, wf_elements_init_min) with OFFSET_NULL.
     /// Only initializes within the allocated range.
+    #[inline(always)]
     pub fn init_ends_lower(&mut self, min_lo: i32) {
         if self.wf_elements_init_min <= min_lo {
             return;
         }
         let min_init = self.wf_elements_init_min.min(self.lo);
-        let start = min_lo.max(self.wf_elements_allocated_min);
+        let allocated_min = self.base_k;
+        let start = min_lo.max(allocated_min);
         let from = (start - self.base_k) as usize;
         let to = (min_init - self.base_k) as usize;
-        self.offsets_mem[from..to].fill(OFFSET_NULL);
+        unsafe {
+            let slice = std::slice::from_raw_parts_mut(self.offsets_ptr.add(from), to - from);
+            slice.fill(OFFSET_NULL);
+        }
         self.wf_elements_init_min = start;
     }
 
     /// Extend the initialized range upward to `max_hi`.
     /// Fills positions (wf_elements_init_max, max_hi] with OFFSET_NULL.
     /// Only initializes within the allocated range.
+    #[inline(always)]
     pub fn init_ends_higher(&mut self, max_hi: i32) {
         if self.wf_elements_init_max >= max_hi {
             return;
         }
         let max_init = self.wf_elements_init_max.max(self.hi);
-        let end = max_hi.min(self.wf_elements_allocated_max);
+        let allocated_max = self.base_k + self.wf_elements_allocated - 1;
+        let end = max_hi.min(allocated_max);
         let from = (max_init + 1 - self.base_k) as usize;
         let to = (end + 1 - self.base_k) as usize;
-        self.offsets_mem[from..to].fill(OFFSET_NULL);
+        unsafe {
+            let slice = std::slice::from_raw_parts_mut(self.offsets_ptr.add(from), to - from);
+            slice.fill(OFFSET_NULL);
+        }
         self.wf_elements_init_max = end;
     }
 
@@ -221,46 +263,52 @@ impl Wavefront {
     /// Get the offset at diagonal `k`.
     #[inline(always)]
     pub fn get_offset(&self, k: i32) -> WfOffset {
-        self.offsets_mem[(k - self.base_k) as usize]
+        unsafe { *self.offsets_ptr.add((k - self.base_k) as usize) }
     }
 
     /// Set the offset at diagonal `k`.
     #[inline(always)]
     pub fn set_offset(&mut self, k: i32, value: WfOffset) {
-        self.offsets_mem[(k - self.base_k) as usize] = value;
+        unsafe { *self.offsets_ptr.add((k - self.base_k) as usize) = value; }
     }
 
     /// Set the offset at diagonal `k` if `k` is within the allocated range.
     /// No-op if `k` is outside the allocated bounds.
     #[inline(always)]
     pub fn set_offset_if_allocated(&mut self, k: i32, value: WfOffset) {
-        if k >= self.wf_elements_allocated_min && k <= self.wf_elements_allocated_max {
-            self.offsets_mem[(k - self.base_k) as usize] = value;
+        let allocated_min = self.base_k;
+        let allocated_max = self.base_k + self.wf_elements_allocated - 1;
+        if k >= allocated_min && k <= allocated_max {
+            unsafe { *self.offsets_ptr.add((k - self.base_k) as usize) = value; }
         }
     }
 
     /// Get the bt_pcigar at diagonal `k`.
     #[inline(always)]
     pub fn get_bt_pcigar(&self, k: i32) -> Pcigar {
-        self.bt_pcigar_mem.as_ref().unwrap()[(k - self.base_k) as usize]
+        debug_assert!(!self.bt_pcigar_ptr.is_null());
+        unsafe { *self.bt_pcigar_ptr.add((k - self.base_k) as usize) }
     }
 
     /// Set the bt_pcigar at diagonal `k`.
     #[inline(always)]
     pub fn set_bt_pcigar(&mut self, k: i32, value: Pcigar) {
-        self.bt_pcigar_mem.as_mut().unwrap()[(k - self.base_k) as usize] = value;
+        debug_assert!(!self.bt_pcigar_ptr.is_null());
+        unsafe { *self.bt_pcigar_ptr.add((k - self.base_k) as usize) = value; }
     }
 
     /// Get the bt_prev at diagonal `k`.
     #[inline(always)]
     pub fn get_bt_prev(&self, k: i32) -> BtBlockIdx {
-        self.bt_prev_mem.as_ref().unwrap()[(k - self.base_k) as usize]
+        debug_assert!(!self.bt_prev_ptr.is_null());
+        unsafe { *self.bt_prev_ptr.add((k - self.base_k) as usize) }
     }
 
     /// Set the bt_prev at diagonal `k`.
     #[inline(always)]
     pub fn set_bt_prev(&mut self, k: i32, value: BtBlockIdx) {
-        self.bt_prev_mem.as_mut().unwrap()[(k - self.base_k) as usize] = value;
+        debug_assert!(!self.bt_prev_ptr.is_null());
+        unsafe { *self.bt_prev_ptr.add((k - self.base_k) as usize) = value; }
     }
 
     /// Get the base k value for raw slice access.
@@ -272,49 +320,84 @@ impl Wavefront {
     /// Get a raw slice of the offsets (for performance-critical inner loops).
     #[inline(always)]
     pub fn offsets_slice(&self) -> &[WfOffset] {
-        &self.offsets_mem
+        unsafe { std::slice::from_raw_parts(self.offsets_ptr, self.wf_elements_allocated as usize) }
     }
 
     /// Get a mutable raw slice of the offsets.
     #[inline(always)]
     pub fn offsets_slice_mut(&mut self) -> &mut [WfOffset] {
-        &mut self.offsets_mem
+        unsafe { std::slice::from_raw_parts_mut(self.offsets_ptr, self.wf_elements_allocated as usize) }
+    }
+
+    /// Get a k-centered const pointer: `ptr[k]` accesses diagonal `k` directly.
+    ///
+    /// # Safety
+    /// Only valid for `k` in `[base_k, base_k + wf_elements_allocated - 1]`.
+    #[inline(always)]
+    pub unsafe fn offsets_centered_ptr(&self) -> *const WfOffset {
+        self.offsets_ptr.wrapping_offset(-(self.base_k as isize))
+    }
+
+    /// Get a k-centered mutable pointer: `ptr[k]` accesses diagonal `k` directly.
+    ///
+    /// # Safety
+    /// Only valid for `k` in `[base_k, base_k + wf_elements_allocated - 1]`.
+    #[inline(always)]
+    pub unsafe fn offsets_centered_mut_ptr(&mut self) -> *mut WfOffset {
+        self.offsets_ptr.wrapping_offset(-(self.base_k as isize))
     }
 
     /// Get a raw slice of bt_pcigar.
     #[inline(always)]
     pub fn bt_pcigar_slice(&self) -> Option<&[Pcigar]> {
-        self.bt_pcigar_mem.as_deref()
+        if self.bt_pcigar_ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { std::slice::from_raw_parts(self.bt_pcigar_ptr, self.wf_elements_allocated as usize) })
+        }
     }
 
     /// Get a mutable raw slice of bt_pcigar.
     #[inline(always)]
     pub fn bt_pcigar_slice_mut(&mut self) -> Option<&mut [Pcigar]> {
-        self.bt_pcigar_mem.as_deref_mut()
+        if self.bt_pcigar_ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { std::slice::from_raw_parts_mut(self.bt_pcigar_ptr, self.wf_elements_allocated as usize) })
+        }
     }
 
     /// Get a raw slice of bt_prev.
     #[inline(always)]
     pub fn bt_prev_slice(&self) -> Option<&[BtBlockIdx]> {
-        self.bt_prev_mem.as_deref()
+        if self.bt_prev_ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { std::slice::from_raw_parts(self.bt_prev_ptr, self.wf_elements_allocated as usize) })
+        }
     }
 
     /// Get a mutable raw slice of bt_prev.
     #[inline(always)]
     pub fn bt_prev_slice_mut(&mut self) -> Option<&mut [BtBlockIdx]> {
-        self.bt_prev_mem.as_deref_mut()
+        if self.bt_prev_ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { std::slice::from_raw_parts_mut(self.bt_prev_ptr, self.wf_elements_allocated as usize) })
+        }
     }
 
     /// Whether this wavefront has backtrace storage.
+    #[inline(always)]
     pub fn has_backtrace(&self) -> bool {
-        self.bt_pcigar_mem.is_some()
+        !self.bt_pcigar_ptr.is_null()
     }
 
     /// Get the memory size of this wavefront in bytes.
     pub fn get_size(&self) -> u64 {
         let mut total =
             (self.wf_elements_allocated as u64) * std::mem::size_of::<WfOffset>() as u64;
-        if self.bt_pcigar_mem.is_some() {
+        if !self.bt_pcigar_ptr.is_null() {
             total += (self.wf_elements_allocated as u64)
                 * (std::mem::size_of::<Pcigar>() + std::mem::size_of::<BtBlockIdx>()) as u64;
         }
@@ -325,6 +408,13 @@ impl Wavefront {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_struct_size() {
+        let size = std::mem::size_of::<Wavefront>();
+        eprintln!("sizeof(Wavefront) = {size}");
+        assert!(size <= 64, "Wavefront should fit in a cache line, got {size}");
+    }
 
     #[test]
     fn test_allocate_and_init() {
@@ -342,7 +432,6 @@ mod tests {
         let mut wf = Wavefront::allocate(11, false);
         wf.init(-5, 5);
 
-        // Set and get offsets at various diagonals
         wf.set_offset(-5, 10);
         wf.set_offset(0, 20);
         wf.set_offset(5, 30);
@@ -358,12 +447,10 @@ mod tests {
         wf.init_null(-5, 5);
         assert!(wf.null);
 
-        // All offsets should be OFFSET_NULL
         for k in -5..=5 {
             assert_eq!(wf.get_offset(k), OFFSET_NULL);
         }
 
-        // BT fields should be zeroed
         for k in -5..=5 {
             assert_eq!(wf.get_bt_pcigar(k), PCIGAR_NULL);
             assert_eq!(wf.get_bt_prev(k), 0);
@@ -402,16 +489,15 @@ mod tests {
 
         wf.resize(20);
         assert_eq!(wf.wf_elements_allocated, 20);
-        // Content is lost after resize
     }
 
     #[test]
     fn test_get_size() {
         let wf = Wavefront::allocate(100, false);
-        assert_eq!(wf.get_size(), 100 * 4); // 4 bytes per WfOffset
+        assert_eq!(wf.get_size(), 100 * 4);
 
         let wf_bt = Wavefront::allocate(100, true);
-        assert_eq!(wf_bt.get_size(), 100 * (4 + 4 + 4)); // offset + pcigar + bt_prev
+        assert_eq!(wf_bt.get_size(), 100 * (4 + 4 + 4));
     }
 
     #[test]

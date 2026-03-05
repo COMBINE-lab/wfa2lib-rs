@@ -109,6 +109,33 @@ impl WavefrontSlab {
         }
     }
 
+    /// Reuse an existing wavefront in-place (skip free-list round-trip).
+    /// Returns the same index after reinitializing the wavefront.
+    #[inline(always)]
+    pub fn reuse_inplace(&mut self, idx: WavefrontIdx, min_lo: i32, max_hi: i32) {
+        let wf = unsafe { self.wavefronts.get_unchecked_mut(idx) };
+        wf.init(min_lo, max_hi);
+        wf.status = WavefrontStatus::Busy;
+    }
+
+    /// Reuse an existing wavefront or allocate a new one.
+    /// If `old_idx` is valid, reuses it in-place (avoids free-list round-trip).
+    /// Otherwise allocates from the free list or creates new.
+    #[inline(always)]
+    pub fn reuse_or_allocate(
+        &mut self,
+        old_idx: WavefrontIdx,
+        min_lo: i32,
+        max_hi: i32,
+    ) -> WavefrontIdx {
+        if old_idx != WAVEFRONT_IDX_NONE {
+            self.reuse_inplace(old_idx, min_lo, max_hi);
+            old_idx
+        } else {
+            self.allocate(min_lo, max_hi)
+        }
+    }
+
     /// Free (return) a wavefront to the slab.
     pub fn free(&mut self, idx: WavefrontIdx) {
         let wf_length = self.wavefronts[idx].wf_elements_allocated;
@@ -146,8 +173,7 @@ impl WavefrontSlab {
     }
 
     /// Ensure the slab's current wavefront length is at least large enough
-    /// to cover the given diagonal range. This should be called before any
-    /// allocations to ensure all wavefronts have sufficient range.
+    /// to cover the given diagonal range.
     pub fn ensure_min_length(&mut self, min_lo: i32, max_hi: i32) {
         let wf_length = wavefront_length(min_lo, max_hi);
         if wf_length > self.current_wf_length {
@@ -173,8 +199,7 @@ impl WavefrontSlab {
     ///
     /// # Safety
     /// The caller must ensure that no two mutable references to the same
-    /// wavefront exist simultaneously. This is intended for the affine compute
-    /// kernel where we need 4+ simultaneous references to distinct wavefronts.
+    /// wavefront exist simultaneously.
     #[inline(always)]
     pub unsafe fn get_raw_mut(&mut self, idx: WavefrontIdx) -> *mut Wavefront {
         unsafe { self.wavefronts.as_mut_ptr().add(idx) }
@@ -234,7 +259,7 @@ impl WavefrontSlab {
         for i in 0..self.wavefronts.len() {
             match self.wavefronts[i].status {
                 WavefrontStatus::Deallocated => {
-                    // Drop (handled by Vec ownership)
+                    // Drop
                 }
                 WavefrontStatus::Busy => {
                     if valid_idx != i {
@@ -289,7 +314,6 @@ mod tests {
         let slab = WavefrontSlab::new(100, false, SlabMode::Reuse);
         assert_eq!(slab.num_wavefronts(), 0);
         assert_eq!(slab.num_free(), 0);
-        assert_eq!(slab.get_size(), 0);
     }
 
     #[test]
@@ -353,8 +377,6 @@ mod tests {
             slab.allocate(-5, 5);
         }
         slab.reap();
-        // After reap, all matching-size wavefronts should be free
-        // But since Reuse mode may have grown, reap resets to init size
     }
 
     #[test]
@@ -363,7 +385,6 @@ mod tests {
         let idx = slab.allocate(-5, 5);
         slab.free(idx);
 
-        // Should reuse init-sized wavefront
         let idx2 = slab.allocate(-3, 3);
         assert_eq!(idx2, idx);
     }
@@ -372,12 +393,10 @@ mod tests {
     fn test_tight_mode_oversized() {
         let mut slab = WavefrontSlab::new(10, false, SlabMode::Tight);
 
-        // Request more than init_wf_length
         let idx = slab.allocate(-10, 10);
         let wf = slab.get(idx);
-        assert!(wf.wf_elements_allocated >= 21); // wavefront_length(-10, 10) = 21
+        assert!(wf.wf_elements_allocated >= 21);
 
-        // Free — won't be reused because it doesn't match init size
         slab.free(idx);
         assert_eq!(slab.num_free(), 0); // Deallocated, not free
     }
@@ -391,16 +410,14 @@ mod tests {
     }
 
     #[test]
-    fn test_memory_tracking() {
-        let mut slab = WavefrontSlab::new(100, false, SlabMode::Reuse);
-        assert_eq!(slab.get_size(), 0);
-
-        let idx = slab.allocate(-5, 5);
-        assert!(slab.get_size() > 0);
-
-        let size_after_alloc = slab.get_size();
-        slab.free(idx);
-        // In Reuse mode with matching size, memory stays allocated
-        assert_eq!(slab.get_size(), size_after_alloc);
+    fn test_clear() {
+        let mut slab = WavefrontSlab::new(20, false, SlabMode::Reuse);
+        for _ in 0..5 {
+            slab.allocate(-5, 5);
+        }
+        slab.clear();
+        // Wavefronts matching current_wf_length are repurposed as free
+        assert_eq!(slab.num_wavefronts(), 5);
+        assert_eq!(slab.num_free(), 5);
     }
 }

@@ -49,18 +49,18 @@ pub fn compute_affine2p_idm(
 ) {
     // SAFETY: Bounds guaranteed by caller (lo/hi clamped, init_ends called).
     unsafe {
-        let m_misms = wf_m_misms.offsets_slice().as_ptr().wrapping_offset(-(wf_m_misms.base_k() as isize));
-        let m_open1 = wf_m_open1.offsets_slice().as_ptr().wrapping_offset(-(wf_m_open1.base_k() as isize));
-        let m_open2 = wf_m_open2.offsets_slice().as_ptr().wrapping_offset(-(wf_m_open2.base_k() as isize));
-        let i1_ext = wf_i1_ext.offsets_slice().as_ptr().wrapping_offset(-(wf_i1_ext.base_k() as isize));
-        let i2_ext = wf_i2_ext.offsets_slice().as_ptr().wrapping_offset(-(wf_i2_ext.base_k() as isize));
-        let d1_ext = wf_d1_ext.offsets_slice().as_ptr().wrapping_offset(-(wf_d1_ext.base_k() as isize));
-        let d2_ext = wf_d2_ext.offsets_slice().as_ptr().wrapping_offset(-(wf_d2_ext.base_k() as isize));
-        let m_curr = wf_m_curr.offsets_slice_mut().as_mut_ptr().wrapping_offset(-(wf_m_curr.base_k() as isize));
-        let i1_curr = wf_i1_curr.offsets_slice_mut().as_mut_ptr().wrapping_offset(-(wf_i1_curr.base_k() as isize));
-        let i2_curr = wf_i2_curr.offsets_slice_mut().as_mut_ptr().wrapping_offset(-(wf_i2_curr.base_k() as isize));
-        let d1_curr = wf_d1_curr.offsets_slice_mut().as_mut_ptr().wrapping_offset(-(wf_d1_curr.base_k() as isize));
-        let d2_curr = wf_d2_curr.offsets_slice_mut().as_mut_ptr().wrapping_offset(-(wf_d2_curr.base_k() as isize));
+        let m_misms = wf_m_misms.offsets_centered_ptr();
+        let m_open1 = wf_m_open1.offsets_centered_ptr();
+        let m_open2 = wf_m_open2.offsets_centered_ptr();
+        let i1_ext = wf_i1_ext.offsets_centered_ptr();
+        let i2_ext = wf_i2_ext.offsets_centered_ptr();
+        let d1_ext = wf_d1_ext.offsets_centered_ptr();
+        let d2_ext = wf_d2_ext.offsets_centered_ptr();
+        let m_curr = wf_m_curr.offsets_centered_mut_ptr();
+        let i1_curr = wf_i1_curr.offsets_centered_mut_ptr();
+        let i2_curr = wf_i2_curr.offsets_centered_mut_ptr();
+        let d1_curr = wf_d1_curr.offsets_centered_mut_ptr();
+        let d2_curr = wf_d2_curr.offsets_centered_mut_ptr();
 
         let count = hi - lo + 1;
         let mut k = lo;
@@ -119,6 +119,74 @@ pub fn compute_affine2p_idm(
 
                         k += 4;
                         v_k = vaddq_s32(v_k, v_four);
+                    }
+                }
+            }
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::arch::x86_64::*;
+            if count >= 8 && is_x86_feature_detected!("avx2") {
+                unsafe {
+                    let v_one = _mm256_set1_epi32(1);
+                    let v_eight = _mm256_set1_epi32(8);
+                    let v_null = _mm256_set1_epi32(OFFSET_NULL);
+                    let v_sign = _mm256_set1_epi32(i32::MIN);
+                    let v_tlen_biased = _mm256_xor_si256(_mm256_set1_epi32(text_length), v_sign);
+                    let v_plen_biased = _mm256_xor_si256(_mm256_set1_epi32(pattern_length), v_sign);
+                    let mut v_k = _mm256_add_epi32(
+                        _mm256_set1_epi32(lo),
+                        _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0),
+                    );
+                    let avx_end = lo + (count & !7);
+
+                    while k < avx_end {
+                        // I1, I2 (shifted by -1)
+                        let v_i1 = _mm256_add_epi32(_mm256_max_epi32(
+                            _mm256_loadu_si256(m_open1.offset(k as isize - 1) as *const __m256i),
+                            _mm256_loadu_si256(i1_ext.offset(k as isize - 1) as *const __m256i),
+                        ), v_one);
+                        let v_i2 = _mm256_add_epi32(_mm256_max_epi32(
+                            _mm256_loadu_si256(m_open2.offset(k as isize - 1) as *const __m256i),
+                            _mm256_loadu_si256(i2_ext.offset(k as isize - 1) as *const __m256i),
+                        ), v_one);
+                        // D1, D2 (shifted by +1)
+                        let v_d1 = _mm256_max_epi32(
+                            _mm256_loadu_si256(m_open1.offset(k as isize + 1) as *const __m256i),
+                            _mm256_loadu_si256(d1_ext.offset(k as isize + 1) as *const __m256i),
+                        );
+                        let v_d2 = _mm256_max_epi32(
+                            _mm256_loadu_si256(m_open2.offset(k as isize + 1) as *const __m256i),
+                            _mm256_loadu_si256(d2_ext.offset(k as isize + 1) as *const __m256i),
+                        );
+                        // M = max(misms+1, max(i1,i2), max(d1,d2))
+                        let v_misms = _mm256_add_epi32(
+                            _mm256_loadu_si256(m_misms.offset(k as isize) as *const __m256i),
+                            v_one,
+                        );
+                        let v_ins = _mm256_max_epi32(v_i1, v_i2);
+                        let v_del = _mm256_max_epi32(v_d1, v_d2);
+                        let v_m = _mm256_max_epi32(v_misms, _mm256_max_epi32(v_ins, v_del));
+
+                        // Bounds check
+                        let v_h_biased = _mm256_xor_si256(v_m, v_sign);
+                        let v_v_biased = _mm256_xor_si256(_mm256_sub_epi32(v_m, v_k), v_sign);
+                        let oob = _mm256_or_si256(
+                            _mm256_cmpgt_epi32(v_h_biased, v_tlen_biased),
+                            _mm256_cmpgt_epi32(v_v_biased, v_plen_biased),
+                        );
+                        let v_m_final = _mm256_blendv_epi8(v_m, v_null, oob);
+
+                        // Store all 5 outputs
+                        _mm256_storeu_si256(m_curr.offset(k as isize) as *mut __m256i, v_m_final);
+                        _mm256_storeu_si256(i1_curr.offset(k as isize) as *mut __m256i, v_i1);
+                        _mm256_storeu_si256(i2_curr.offset(k as isize) as *mut __m256i, v_i2);
+                        _mm256_storeu_si256(d1_curr.offset(k as isize) as *mut __m256i, v_d1);
+                        _mm256_storeu_si256(d2_curr.offset(k as isize) as *mut __m256i, v_d2);
+
+                        k += 8;
+                        v_k = _mm256_add_epi32(v_k, v_eight);
                     }
                 }
             }

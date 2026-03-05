@@ -16,40 +16,51 @@ use crate::wavefront::Wavefront;
 /// pattern[v..] with text[h..] where v = offset - k, h = offset.
 /// Uses 8-byte XOR blocks with trailing-zero count for fast matching.
 /// Sentinel characters and 64-byte padding guarantee safe termination.
+///
+/// Inner loop structured so the common path (mismatch in first block)
+/// falls through without a taken branch, matching C's __builtin_expect pattern.
 #[inline]
 pub fn extend_matches_packed_end2end(sequences: &WavefrontSequences, wf: &mut Wavefront) {
     let lo = wf.lo;
     let hi = wf.hi;
-    let pattern = sequences.pattern_ptr();
-    let text = sequences.text_ptr();
+    let pattern_base = sequences.pattern_ptr().as_ptr();
+    let text_base = sequences.text_ptr().as_ptr();
 
     // SAFETY: Bounds guaranteed by caller (lo/hi within wavefront range).
     // Sentinels ('!' vs '?') guarantee termination. 64-byte padding
     // ensures reads don't go out of the allocated buffer.
     unsafe {
-        let offsets = wf.offsets_slice_mut().as_mut_ptr().wrapping_offset(-(wf.base_k() as isize));
+        // Walk offsets with a raw pointer to avoid per-diagonal index computation.
+        let offsets_base = wf.offsets_slice_mut().as_mut_ptr();
+        let base_k = wf.base_k();
+        let mut off_ptr = offsets_base.add((lo - base_k) as usize);
+        let off_end = offsets_base.add((hi - base_k) as usize).add(1);
+        let mut k = lo;
 
-        for k in lo..=hi {
-            let mut offset = *offsets.offset(k as isize);
-            if offset == OFFSET_NULL {
-                continue;
-            }
-
-            let mut p_ptr = pattern.as_ptr().add((offset - k) as usize);
-            let mut t_ptr = text.as_ptr().add(offset as usize);
-            loop {
-                let cmp = (p_ptr as *const u64).read_unaligned()
+        while off_ptr < off_end {
+            let mut offset = *off_ptr;
+            if offset != OFFSET_NULL {
+                let v = (offset - k) as usize;
+                let h = offset as usize;
+                let mut p_ptr = pattern_base.add(v);
+                let mut t_ptr = text_base.add(h);
+                // Pre-compute first comparison (C pattern: compare before loop)
+                let mut cmp = (p_ptr as *const u64).read_unaligned()
                     ^ (t_ptr as *const u64).read_unaligned();
-                if cmp != 0 {
-                    offset += (cmp.trailing_zeros() / 8) as i32;
-                    break;
+                // Loop while blocks match (unlikely — most extensions are short)
+                while cmp == 0 {
+                    offset += 8;
+                    p_ptr = p_ptr.add(8);
+                    t_ptr = t_ptr.add(8);
+                    cmp = (p_ptr as *const u64).read_unaligned()
+                        ^ (t_ptr as *const u64).read_unaligned();
                 }
-                offset += 8;
-                p_ptr = p_ptr.add(8);
-                t_ptr = t_ptr.add(8);
+                // Count matching characters in the mismatched block
+                offset += (cmp.trailing_zeros() / 8) as i32;
+                *off_ptr = offset;
             }
-
-            *offsets.offset(k as isize) = offset;
+            off_ptr = off_ptr.add(1);
+            k += 1;
         }
     }
 }
@@ -62,40 +73,44 @@ pub fn extend_matches_packed_end2end_max(
 ) -> WfOffset {
     let lo = wf.lo;
     let hi = wf.hi;
-    let pattern = sequences.pattern_ptr();
-    let text = sequences.text_ptr();
+    let pattern_base = sequences.pattern_ptr().as_ptr();
+    let text_base = sequences.text_ptr().as_ptr();
     let mut max_antidiag: WfOffset = 0;
 
     // SAFETY: Same as extend_matches_packed_end2end.
     unsafe {
-        let offsets = wf.offsets_slice_mut().as_mut_ptr().wrapping_offset(-(wf.base_k() as isize));
+        let offsets_base = wf.offsets_slice_mut().as_mut_ptr();
+        let base_k = wf.base_k();
+        let mut off_ptr = offsets_base.add((lo - base_k) as usize);
+        let off_end = offsets_base.add((hi - base_k) as usize).add(1);
+        let mut k = lo;
 
-        for k in lo..=hi {
-            let mut offset = *offsets.offset(k as isize);
-            if offset == OFFSET_NULL {
-                continue;
-            }
-
-            let mut p_ptr = pattern.as_ptr().add((offset - k) as usize);
-            let mut t_ptr = text.as_ptr().add(offset as usize);
-            loop {
-                let cmp = (p_ptr as *const u64).read_unaligned()
+        while off_ptr < off_end {
+            let mut offset = *off_ptr;
+            if offset != OFFSET_NULL {
+                let v = (offset - k) as usize;
+                let h = offset as usize;
+                let mut p_ptr = pattern_base.add(v);
+                let mut t_ptr = text_base.add(h);
+                let mut cmp = (p_ptr as *const u64).read_unaligned()
                     ^ (t_ptr as *const u64).read_unaligned();
-                if cmp != 0 {
-                    offset += (cmp.trailing_zeros() / 8) as i32;
-                    break;
+                while cmp == 0 {
+                    offset += 8;
+                    p_ptr = p_ptr.add(8);
+                    t_ptr = t_ptr.add(8);
+                    cmp = (p_ptr as *const u64).read_unaligned()
+                        ^ (t_ptr as *const u64).read_unaligned();
                 }
-                offset += 8;
-                p_ptr = p_ptr.add(8);
-                t_ptr = t_ptr.add(8);
-            }
+                offset += (cmp.trailing_zeros() / 8) as i32;
+                *off_ptr = offset;
 
-            *offsets.offset(k as isize) = offset;
-
-            let antidiag = 2 * offset - k;
-            if antidiag > max_antidiag {
-                max_antidiag = antidiag;
+                let antidiag = 2 * offset - k;
+                if antidiag > max_antidiag {
+                    max_antidiag = antidiag;
+                }
             }
+            off_ptr = off_ptr.add(1);
+            k += 1;
         }
     }
 
@@ -114,48 +129,52 @@ pub fn extend_matches_packed_endsfree(
 ) -> Option<(i32, WfOffset)> {
     let lo = wf.lo;
     let hi = wf.hi;
-    let pattern = sequences.pattern_ptr();
-    let text = sequences.text_ptr();
+    let pattern_base = sequences.pattern_ptr().as_ptr();
+    let text_base = sequences.text_ptr().as_ptr();
     let pattern_length = sequences.pattern_length;
     let text_length = sequences.text_length;
 
     // SAFETY: Same as extend_matches_packed_end2end.
     unsafe {
-        let offsets = wf.offsets_slice_mut().as_mut_ptr().wrapping_offset(-(wf.base_k() as isize));
+        let offsets_base = wf.offsets_slice_mut().as_mut_ptr();
+        let base_k = wf.base_k();
+        let mut off_ptr = offsets_base.add((lo - base_k) as usize);
+        let off_end = offsets_base.add((hi - base_k) as usize).add(1);
+        let mut k = lo;
 
-        for k in lo..=hi {
-            let mut offset = *offsets.offset(k as isize);
-            if offset == OFFSET_NULL {
-                continue;
-            }
-
-            let mut p_ptr = pattern.as_ptr().add((offset - k) as usize);
-            let mut t_ptr = text.as_ptr().add(offset as usize);
-            loop {
-                let cmp = (p_ptr as *const u64).read_unaligned()
+        while off_ptr < off_end {
+            let mut offset = *off_ptr;
+            if offset != OFFSET_NULL {
+                let v = (offset - k) as usize;
+                let h = offset as usize;
+                let mut p_ptr = pattern_base.add(v);
+                let mut t_ptr = text_base.add(h);
+                let mut cmp = (p_ptr as *const u64).read_unaligned()
                     ^ (t_ptr as *const u64).read_unaligned();
-                if cmp != 0 {
-                    offset += (cmp.trailing_zeros() / 8) as i32;
-                    break;
+                while cmp == 0 {
+                    offset += 8;
+                    p_ptr = p_ptr.add(8);
+                    t_ptr = t_ptr.add(8);
+                    cmp = (p_ptr as *const u64).read_unaligned()
+                        ^ (t_ptr as *const u64).read_unaligned();
                 }
-                offset += 8;
-                p_ptr = p_ptr.add(8);
-                t_ptr = t_ptr.add(8);
-            }
+                offset += (cmp.trailing_zeros() / 8) as i32;
+                *off_ptr = offset;
 
-            *offsets.offset(k as isize) = offset;
-
-            // Check ends-free termination at this diagonal
-            if termination::termination_endsfree(
-                pattern_length,
-                text_length,
-                pattern_end_free,
-                text_end_free,
-                k,
-                offset,
-            ) {
-                return Some((k, offset));
+                // Check ends-free termination at this diagonal
+                if termination::termination_endsfree(
+                    pattern_length,
+                    text_length,
+                    pattern_end_free,
+                    text_end_free,
+                    k,
+                    offset,
+                ) {
+                    return Some((k, offset));
+                }
             }
+            off_ptr = off_ptr.add(1);
+            k += 1;
         }
     }
 

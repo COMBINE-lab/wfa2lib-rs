@@ -45,13 +45,13 @@ pub fn compute_affine_idm(
     // Output wavefronts are allocated with full [hist_lo, hist_hi] range.
     // All final pointer dereferences are within allocated bounds.
     unsafe {
-        let m_misms = wf_m_misms.offsets_slice().as_ptr().wrapping_offset(-(wf_m_misms.base_k() as isize));
-        let m_open = wf_m_open.offsets_slice().as_ptr().wrapping_offset(-(wf_m_open.base_k() as isize));
-        let i1_ext = wf_i1_ext.offsets_slice().as_ptr().wrapping_offset(-(wf_i1_ext.base_k() as isize));
-        let d1_ext = wf_d1_ext.offsets_slice().as_ptr().wrapping_offset(-(wf_d1_ext.base_k() as isize));
-        let m_curr = wf_m_curr.offsets_slice_mut().as_mut_ptr().wrapping_offset(-(wf_m_curr.base_k() as isize));
-        let i1_curr = wf_i1_curr.offsets_slice_mut().as_mut_ptr().wrapping_offset(-(wf_i1_curr.base_k() as isize));
-        let d1_curr = wf_d1_curr.offsets_slice_mut().as_mut_ptr().wrapping_offset(-(wf_d1_curr.base_k() as isize));
+        let m_misms = wf_m_misms.offsets_centered_ptr();
+        let m_open = wf_m_open.offsets_centered_ptr();
+        let i1_ext = wf_i1_ext.offsets_centered_ptr();
+        let d1_ext = wf_d1_ext.offsets_centered_ptr();
+        let m_curr = wf_m_curr.offsets_centered_mut_ptr();
+        let i1_curr = wf_i1_curr.offsets_centered_mut_ptr();
+        let d1_curr = wf_d1_curr.offsets_centered_mut_ptr();
 
         #[cfg(target_arch = "aarch64")]
         {
@@ -63,7 +63,26 @@ pub fn compute_affine_idm(
             );
         }
 
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") {
+                compute_affine_idm_avx2(
+                    pattern_length, text_length,
+                    m_misms, m_open, i1_ext, d1_ext,
+                    m_curr, i1_curr, d1_curr,
+                    lo, hi,
+                );
+            } else {
+                compute_affine_idm_scalar(
+                    pattern_length, text_length,
+                    m_misms, m_open, i1_ext, d1_ext,
+                    m_curr, i1_curr, d1_curr,
+                    lo, hi,
+                );
+            }
+        }
+
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
             compute_affine_idm_scalar(
                 pattern_length, text_length,
@@ -172,7 +191,113 @@ unsafe fn compute_affine_idm_neon(
     }
 }
 
-/// Scalar fallback for non-aarch64 platforms.
+/// AVX2-vectorized inner loop: processes 8 diagonals at a time.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments, unsafe_op_in_unsafe_fn)]
+unsafe fn compute_affine_idm_avx2(
+    pattern_length: i32,
+    text_length: i32,
+    m_misms: *const WfOffset,
+    m_open: *const WfOffset,
+    i1_ext: *const WfOffset,
+    d1_ext: *const WfOffset,
+    m_curr: *mut WfOffset,
+    i1_curr: *mut WfOffset,
+    d1_curr: *mut WfOffset,
+    lo: i32,
+    hi: i32,
+) {
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let count = hi - lo + 1;
+    if count <= 0 {
+        return;
+    }
+
+    let mut k = lo;
+
+    if count >= 8 {
+        unsafe {
+            let v_one = _mm256_set1_epi32(1);
+            let v_eight = _mm256_set1_epi32(8);
+            let v_null = _mm256_set1_epi32(OFFSET_NULL);
+            let v_tlen = _mm256_set1_epi32(text_length);
+            let v_plen = _mm256_set1_epi32(pattern_length);
+            let v_sign = _mm256_set1_epi32(i32::MIN); // for unsigned compare
+            // Bias tlen/plen for unsigned comparison: xor with sign bit
+            let v_tlen_biased = _mm256_xor_si256(v_tlen, v_sign);
+            let v_plen_biased = _mm256_xor_si256(v_plen, v_sign);
+            let mut v_k = _mm256_add_epi32(
+                _mm256_set1_epi32(lo),
+                _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0),
+            );
+            let avx_end = lo + (count & !7);
+
+            while k < avx_end {
+                // I1: load m_open[k-1] and i1_ext[k-1]
+                let v_m_open_km1 = _mm256_loadu_si256(m_open.offset(k as isize - 1) as *const __m256i);
+                let v_i1_ext_km1 = _mm256_loadu_si256(i1_ext.offset(k as isize - 1) as *const __m256i);
+                let v_i1 = _mm256_add_epi32(_mm256_max_epi32(v_m_open_km1, v_i1_ext_km1), v_one);
+
+                // D1: load m_open[k+1] and d1_ext[k+1]
+                let v_m_open_kp1 = _mm256_loadu_si256(m_open.offset(k as isize + 1) as *const __m256i);
+                let v_d1_ext_kp1 = _mm256_loadu_si256(d1_ext.offset(k as isize + 1) as *const __m256i);
+                let v_d1 = _mm256_max_epi32(v_m_open_kp1, v_d1_ext_kp1);
+
+                // M: load m_misms[k], add 1, then max with i1, d1
+                let v_misms = _mm256_add_epi32(
+                    _mm256_loadu_si256(m_misms.offset(k as isize) as *const __m256i),
+                    v_one,
+                );
+                let v_m = _mm256_max_epi32(v_d1, _mm256_max_epi32(v_misms, v_i1));
+
+                // Bounds check: unsigned h > tlen || v > plen
+                // Use XOR with sign bit for unsigned comparison
+                let v_h_biased = _mm256_xor_si256(v_m, v_sign);
+                let v_v = _mm256_sub_epi32(v_m, v_k);
+                let v_v_biased = _mm256_xor_si256(v_v, v_sign);
+                let h_oob = _mm256_cmpgt_epi32(v_h_biased, v_tlen_biased);
+                let v_oob = _mm256_cmpgt_epi32(v_v_biased, v_plen_biased);
+                let oob = _mm256_or_si256(h_oob, v_oob);
+                let v_m_final = _mm256_blendv_epi8(v_m, v_null, oob);
+
+                // Store results
+                _mm256_storeu_si256(m_curr.offset(k as isize) as *mut __m256i, v_m_final);
+                _mm256_storeu_si256(i1_curr.offset(k as isize) as *mut __m256i, v_i1);
+                _mm256_storeu_si256(d1_curr.offset(k as isize) as *mut __m256i, v_d1);
+
+                k += 8;
+                v_k = _mm256_add_epi32(v_k, v_eight);
+            }
+        }
+    }
+
+    // Scalar tail for remaining diagonals
+    while k <= hi {
+        let i1_val: WfOffset = (*m_open.offset(k as isize - 1))
+            .max(*i1_ext.offset(k as isize - 1)) + 1;
+        let d1_val: WfOffset = (*m_open.offset(k as isize + 1))
+            .max(*d1_ext.offset(k as isize + 1));
+        let misms = *m_misms.offset(k as isize) + 1;
+        let mut m: WfOffset = misms.max(i1_val.max(d1_val));
+
+        let h = wavefront_h(k, m) as u32;
+        let v = wavefront_v(k, m) as u32;
+        if h > text_length as u32 || v > pattern_length as u32 {
+            m = OFFSET_NULL;
+        }
+
+        *m_curr.offset(k as isize) = m;
+        *i1_curr.offset(k as isize) = i1_val;
+        *d1_curr.offset(k as isize) = d1_val;
+        k += 1;
+    }
+}
+
+/// Scalar fallback.
 #[cfg(not(target_arch = "aarch64"))]
 #[inline]
 #[allow(clippy::too_many_arguments, unsafe_op_in_unsafe_fn)]

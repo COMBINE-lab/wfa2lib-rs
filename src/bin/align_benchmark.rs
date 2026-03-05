@@ -3,6 +3,10 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use clap::Parser;
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 use wfa2lib_rs::aligner::{AlignmentScope, WavefrontAligner};
 use wfa2lib_rs::heuristic::HeuristicStrategy;
 use wfa2lib_rs::penalties::{
