@@ -25,3 +25,4 @@ WFA2-lib
 # Added by cargo
 
 /target
+bench/data/

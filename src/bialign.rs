@@ -4,7 +4,7 @@
 //! Forward and reverse wavefronts expand toward each other until they overlap,
 //! producing a breakpoint that splits the problem into two halves.
 
-use crate::offset::{WfOffset, wavefront_h, wavefront_k_inverse, wavefront_v};
+use crate::offset::{WfOffset, wavefront_k_inverse, wavefront_v};
 use crate::slab::WAVEFRONT_IDX_NONE;
 use crate::wavefront::Wavefront;
 
@@ -75,6 +75,7 @@ pub fn overlap_gopen_adjust(gap_opening1: i32, gap_opening2: i32, has_affine2p: 
 ///
 /// If `h_0 + h_1 >= text_length` for any overlapping diagonal, a breakpoint is found.
 /// `breakpoint_forward`: if true, wf_0 is the forward aligner; if false, wf_0 is reverse.
+#[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub fn breakpoint_m2m(
     wf_0: &Wavefront,
@@ -105,21 +106,83 @@ pub fn breakpoint_m2m(
     let max_lo = lo_0.max(lo_1_inv);
     let min_hi = hi_0.min(hi_1_inv);
 
-    let base_k_0 = wf_0.base_k();
-    let base_k_1 = wf_1.base_k();
-    let offsets_0 = wf_0.offsets_slice();
-    let offsets_1 = wf_1.offsets_slice();
+    // Use k-centered raw pointers: ptr[k] directly accesses diagonal k.
+    // SAFETY: k_0 ∈ [max_lo, min_hi] ⊆ [lo_0, hi_0] ⊆ allocated range of wf_0.
+    //         k_1 ∈ [wf_1.lo, wf_1.hi] ⊆ allocated range of wf_1 (by construction of lo_1_inv/hi_1_inv).
+    let ptr_0 = unsafe { wf_0.offsets_centered_ptr() };
+    let ptr_1 = unsafe { wf_1.offsets_centered_ptr() };
 
-    for k_0 in max_lo..=min_hi {
+    let mut k_0 = max_lo;
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::*;
+        let count = min_hi - max_lo + 1;
+        if count >= 4 {
+            unsafe {
+                let v_tlen = vdupq_n_s32(text_length);
+                let neon_end = max_lo + (count & !3);
+                // k_1 = (tlen - plen) - k_0, decreasing: for batch starting at k_0,
+                // k_1 values are [k_1_0, k_1_0-1, k_1_0-2, k_1_0-3].
+                // In memory those are at ptr_1[k_1_0-3..k_1_0], so load and reverse.
+                let mut k_1_top = wavefront_k_inverse(k_0, pattern_length, text_length);
+
+                while k_0 < neon_end {
+                    let v_off0 = vld1q_s32(ptr_0.offset(k_0 as isize));
+                    // Load [k_1_top-3, k_1_top-2, k_1_top-1, k_1_top] then reverse to [k_1_top, k_1_top-1, k_1_top-2, k_1_top-3]
+                    let v_raw1 = vld1q_s32(ptr_1.offset((k_1_top - 3) as isize));
+                    let v_r64 = vrev64q_s32(v_raw1);
+                    let v_off1 = vcombine_s32(vget_high_s32(v_r64), vget_low_s32(v_r64));
+
+                    let v_sum = vaddq_s32(v_off0, v_off1);
+                    let v_mask = vcgeq_s32(v_sum, v_tlen);
+
+                    if vmaxvq_u32(v_mask) != 0 {
+                        // Scalar scan within this batch to find first hit
+                        let sums: [i32; 4] = std::mem::transmute(v_sum);
+                        for i in 0..4 {
+                            if sums[i] >= text_length {
+                                let k_hit = k_0 + i as i32;
+                                let k_1_hit = k_1_top - i as i32;
+                                let offset_0 = *ptr_0.offset(k_hit as isize);
+                                let offset_1 = *ptr_1.offset(k_1_hit as isize);
+                                if breakpoint_forward {
+                                    breakpoint.score_forward = score_0;
+                                    breakpoint.score_reverse = score_1;
+                                    breakpoint.k_forward = k_hit;
+                                    breakpoint.k_reverse = k_1_hit;
+                                    breakpoint.offset_forward = offset_0;
+                                    breakpoint.offset_reverse = offset_1;
+                                } else {
+                                    breakpoint.score_forward = score_1;
+                                    breakpoint.score_reverse = score_0;
+                                    breakpoint.k_forward = k_1_hit;
+                                    breakpoint.k_reverse = k_hit;
+                                    breakpoint.offset_forward = offset_1;
+                                    breakpoint.offset_reverse = offset_0;
+                                }
+                                breakpoint.score = score_0 + score_1;
+                                breakpoint.component = ComponentType::M;
+                                return;
+                            }
+                        }
+                    }
+
+                    k_0 += 4;
+                    k_1_top -= 4;
+                }
+            }
+        }
+    }
+
+    // Scalar tail (or full scalar on non-aarch64)
+    while k_0 <= min_hi {
         let k_1 = wavefront_k_inverse(k_0, pattern_length, text_length);
+        // SAFETY: bounds guaranteed by construction above.
+        let offset_0 = unsafe { *ptr_0.offset(k_0 as isize) };
+        let offset_1 = unsafe { *ptr_1.offset(k_1 as isize) };
 
-        let offset_0 = offsets_0[(k_0 - base_k_0) as usize];
-        let offset_1 = offsets_1[(k_1 - base_k_1) as usize];
-
-        let h_0 = wavefront_h(k_0, offset_0);
-        let h_1 = wavefront_h(k_1, offset_1);
-
-        if h_0 + h_1 >= text_length {
+        if offset_0 + offset_1 >= text_length {
             if breakpoint_forward {
                 breakpoint.score_forward = score_0;
                 breakpoint.score_reverse = score_1;
@@ -139,12 +202,14 @@ pub fn breakpoint_m2m(
             breakpoint.component = ComponentType::M;
             return;
         }
+        k_0 += 1;
     }
 }
 
 /// Check I/D-to-I/D wavefront overlap between forward and reverse wavefronts.
 ///
 /// Same as m2m but subtracts gap_opening from the combined score.
+#[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub fn breakpoint_indel2indel(
     wf_0: &Wavefront,
@@ -175,26 +240,22 @@ pub fn breakpoint_indel2indel(
     let max_lo = lo_0.max(lo_1_inv);
     let min_hi = hi_0.min(hi_1_inv);
 
-    let base_k_0 = wf_0.base_k();
-    let base_k_1 = wf_1.base_k();
-    let offsets_0 = wf_0.offsets_slice();
-    let offsets_1 = wf_1.offsets_slice();
+    // Use k-centered raw pointers: ptr[k] directly accesses diagonal k.
+    // SAFETY: same argument as breakpoint_m2m — k_0 ∈ [lo_0, hi_0] and k_1 ∈ [wf_1.lo, wf_1.hi].
+    let ptr_0 = unsafe { wf_0.offsets_centered_ptr() };
+    let ptr_1 = unsafe { wf_1.offsets_centered_ptr() };
 
     for k_0 in max_lo..=min_hi {
         let k_1 = wavefront_k_inverse(k_0, pattern_length, text_length);
+        let offset_0 = unsafe { *ptr_0.offset(k_0 as isize) };
+        let offset_1 = unsafe { *ptr_1.offset(k_1 as isize) };
 
-        let offset_0 = offsets_0[(k_0 - base_k_0) as usize];
-        let offset_1 = offsets_1[(k_1 - base_k_1) as usize];
-
-        let h_0 = wavefront_h(k_0, offset_0);
-        let h_1 = wavefront_h(k_1, offset_1);
-
-        if h_0 + h_1 >= text_length {
+        if offset_0 + offset_1 >= text_length {
             // Extra bounds check for indel breakpoints
             let (check_k, check_h) = if breakpoint_forward {
-                (k_0, h_0)
+                (k_0, offset_0)
             } else {
-                (k_1, h_1)
+                (k_1, offset_1)
             };
             let v = wavefront_v(check_k, check_h);
             if v > pattern_length || check_h > text_length {
