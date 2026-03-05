@@ -85,6 +85,11 @@ pub struct WavefrontAligner {
 
     // System limits
     pub max_alignment_steps: i32,
+
+    // BiWFA sub-aligners (lazily initialized, reused across align_biwfa calls)
+    biwfa_fwd: Option<Box<WavefrontAligner>>,
+    biwfa_rev: Option<Box<WavefrontAligner>>,
+    biwfa_base: Option<Box<WavefrontAligner>>,
 }
 
 impl WavefrontAligner {
@@ -112,6 +117,9 @@ impl WavefrontAligner {
             heuristic: HeuristicStrategy::None,
             heuristic_state: HeuristicState::default(),
             max_alignment_steps: i32::MAX,
+            biwfa_fwd: None,
+            biwfa_rev: None,
+            biwfa_base: None,
         }
     }
 
@@ -1237,12 +1245,20 @@ impl WavefrontAligner {
         self.cigar.resize(max_ops);
         self.status = AlignStatus::Ok;
 
-        // Create sub-aligners: fwd/rev use modular storage (score-only),
-        // base uses full storage (compute alignment for fallback).
-        let mut fwd = Self::new_biwfa_sub(self.penalties.clone());
-        let mut rev = Self::new_biwfa_sub(self.penalties.clone());
-        let mut base = WavefrontAligner::new(self.penalties.clone());
-        base.alignment_scope = AlignmentScope::ComputeAlignment;
+        // Lazily create sub-aligners and reuse them across calls (avoids 3×N alloc/free
+        // per alignment). fwd/rev use modular storage; base uses full CIGAR storage.
+        if self.biwfa_fwd.is_none() {
+            self.biwfa_fwd = Some(Box::new(Self::new_biwfa_sub(self.penalties.clone())));
+            self.biwfa_rev = Some(Box::new(Self::new_biwfa_sub(self.penalties.clone())));
+            let mut b = WavefrontAligner::new(self.penalties.clone());
+            b.alignment_scope = AlignmentScope::ComputeAlignment;
+            self.biwfa_base = Some(Box::new(b));
+        }
+
+        // Take sub-aligners out of self so we can borrow self.cigar/penalties separately.
+        let mut fwd = self.biwfa_fwd.take().unwrap();
+        let mut rev = self.biwfa_rev.take().unwrap();
+        let mut base = self.biwfa_base.take().unwrap();
 
         let score = Self::bialign_recursive(
             &mut self.cigar,
@@ -1266,6 +1282,11 @@ impl WavefrontAligner {
         self.cigar.end_v = plen;
         self.cigar.end_h = tlen;
         self.status = AlignStatus::Completed;
+
+        // Return sub-aligners to self for reuse on the next call.
+        self.biwfa_fwd = Some(fwd);
+        self.biwfa_rev = Some(rev);
+        self.biwfa_base = Some(base);
 
         score
     }
@@ -1317,6 +1338,9 @@ impl WavefrontAligner {
             heuristic: HeuristicStrategy::None,
             heuristic_state: HeuristicState::default(),
             max_alignment_steps: i32::MAX,
+            biwfa_fwd: None,
+            biwfa_rev: None,
+            biwfa_base: None,
         }
     }
 
