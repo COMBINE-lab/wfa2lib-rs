@@ -288,27 +288,38 @@ fn bt_d1_ext(wf_components: &WavefrontComponents, slab: &WavefrontSlab, score: i
     }
 }
 
-/// Affine backtrace: look up M→I1 open at (score, k-1), offset + 1.
+/// Look up both M→I1 open (k-1, offset+1) and M→D1 open (k+1, offset) from
+/// the same M-wavefront at the given score. Returns (ins1_open, del1_open).
+/// This avoids a redundant get_m_idx + slab.get double-fetch.
 #[inline(always)]
-fn bt_affine_ins1_open(
+fn bt_open1_pair(
     wf_components: &WavefrontComponents,
     slab: &WavefrontSlab,
     score: i32,
     k: i32,
-) -> i64 {
+) -> (i64, i64) {
     if score < 0 {
-        return OFFSET_NULL as i64;
+        return (OFFSET_NULL as i64, OFFSET_NULL as i64);
     }
     let m_idx = wf_components.get_m_idx(score as usize);
     if m_idx == WAVEFRONT_IDX_NONE {
-        return OFFSET_NULL as i64;
+        return (OFFSET_NULL as i64, OFFSET_NULL as i64);
     }
     let wf = slab.get(m_idx);
-    if wf.wf_elements_init_min < k && k - 1 <= wf.wf_elements_init_max {
+    let min = wf.wf_elements_init_min;
+    let max = wf.wf_elements_init_max;
+
+    let ins = if min < k && k - 1 <= max {
         piggyback_set(wf.get_offset(k - 1) + 1, BT_I1_OPEN)
     } else {
         OFFSET_NULL as i64
-    }
+    };
+    let del = if min <= k + 1 && k < max {
+        piggyback_set(wf.get_offset(k + 1), BT_D1_OPEN)
+    } else {
+        OFFSET_NULL as i64
+    };
+    (ins, del)
 }
 
 /// Affine backtrace: look up I1 extend at (score, k-1), offset + 1.
@@ -329,29 +340,6 @@ fn bt_affine_ins1_ext(
     let wf = slab.get(i1_idx);
     if wf.wf_elements_init_min < k && k - 1 <= wf.wf_elements_init_max {
         piggyback_set(wf.get_offset(k - 1) + 1, BT_I1_EXT)
-    } else {
-        OFFSET_NULL as i64
-    }
-}
-
-/// Affine backtrace: look up M→D1 open at (score, k+1), offset unchanged.
-#[inline(always)]
-fn bt_affine_del1_open(
-    wf_components: &WavefrontComponents,
-    slab: &WavefrontSlab,
-    score: i32,
-    k: i32,
-) -> i64 {
-    if score < 0 {
-        return OFFSET_NULL as i64;
-    }
-    let m_idx = wf_components.get_m_idx(score as usize);
-    if m_idx == WAVEFRONT_IDX_NONE {
-        return OFFSET_NULL as i64;
-    }
-    let wf = slab.get(m_idx);
-    if wf.wf_elements_init_min <= k + 1 && k < wf.wf_elements_init_max {
-        piggyback_set(wf.get_offset(k + 1), BT_D1_OPEN)
     } else {
         OFFSET_NULL as i64
     }
@@ -489,7 +477,8 @@ pub fn backtrace_affine(
             }
             1 => {
                 // In I1-matrix: predecessors are gap open (M→I1) or gap extend (I1→I1)
-                let ins_open = bt_affine_ins1_open(wf_components, slab, score - o_plus_e, k);
+                // bt_open1_pair fetches M-wavefront once for both ins_open and del_open
+                let (ins_open, _) = bt_open1_pair(wf_components, slab, score - o_plus_e, k);
                 let ins_ext = bt_affine_ins1_ext(wf_components, slab, score - e, k);
 
                 let max_all = ins_open.max(ins_ext);
@@ -522,7 +511,7 @@ pub fn backtrace_affine(
             }
             2 => {
                 // In D1-matrix: predecessors are gap open (M→D1) or gap extend (D1→D1)
-                let del_open = bt_affine_del1_open(wf_components, slab, score - o_plus_e, k);
+                let (_, del_open) = bt_open1_pair(wf_components, slab, score - o_plus_e, k);
                 let del_ext = bt_affine_del1_ext(wf_components, slab, score - e, k);
 
                 let max_all = del_open.max(del_ext);
@@ -622,27 +611,37 @@ fn bt_d2_ext(wf_components: &WavefrontComponents, slab: &WavefrontSlab, score: i
     }
 }
 
-/// Affine2p backtrace: look up M→I2 open at (score, k-1), offset + 1.
+/// Look up both M→I2 open (k-1, offset+1) and M→D2 open (k+1, offset) from
+/// the same M-wavefront at the given score. Returns (ins2_open, del2_open).
 #[inline(always)]
-fn bt_affine_ins2_open(
+fn bt_open2_pair(
     wf_components: &WavefrontComponents,
     slab: &WavefrontSlab,
     score: i32,
     k: i32,
-) -> i64 {
+) -> (i64, i64) {
     if score < 0 {
-        return OFFSET_NULL as i64;
+        return (OFFSET_NULL as i64, OFFSET_NULL as i64);
     }
     let m_idx = wf_components.get_m_idx(score as usize);
     if m_idx == WAVEFRONT_IDX_NONE {
-        return OFFSET_NULL as i64;
+        return (OFFSET_NULL as i64, OFFSET_NULL as i64);
     }
     let wf = slab.get(m_idx);
-    if wf.wf_elements_init_min < k && k - 1 <= wf.wf_elements_init_max {
+    let min = wf.wf_elements_init_min;
+    let max = wf.wf_elements_init_max;
+
+    let ins = if min < k && k - 1 <= max {
         piggyback_set(wf.get_offset(k - 1) + 1, BT_I2_OPEN)
     } else {
         OFFSET_NULL as i64
-    }
+    };
+    let del = if min <= k + 1 && k < max {
+        piggyback_set(wf.get_offset(k + 1), BT_D2_OPEN)
+    } else {
+        OFFSET_NULL as i64
+    };
+    (ins, del)
 }
 
 /// Affine2p backtrace: look up I2 extend at (score, k-1), offset + 1.
@@ -663,29 +662,6 @@ fn bt_affine_ins2_ext(
     let wf = slab.get(i2_idx);
     if wf.wf_elements_init_min < k && k - 1 <= wf.wf_elements_init_max {
         piggyback_set(wf.get_offset(k - 1) + 1, BT_I2_EXT)
-    } else {
-        OFFSET_NULL as i64
-    }
-}
-
-/// Affine2p backtrace: look up M→D2 open at (score, k+1), offset unchanged.
-#[inline(always)]
-fn bt_affine_del2_open(
-    wf_components: &WavefrontComponents,
-    slab: &WavefrontSlab,
-    score: i32,
-    k: i32,
-) -> i64 {
-    if score < 0 {
-        return OFFSET_NULL as i64;
-    }
-    let m_idx = wf_components.get_m_idx(score as usize);
-    if m_idx == WAVEFRONT_IDX_NONE {
-        return OFFSET_NULL as i64;
-    }
-    let wf = slab.get(m_idx);
-    if wf.wf_elements_init_min <= k + 1 && k < wf.wf_elements_init_max {
-        piggyback_set(wf.get_offset(k + 1), BT_D2_OPEN)
     } else {
         OFFSET_NULL as i64
     }
@@ -831,7 +807,7 @@ pub fn backtrace_affine2p(
             }
             1 => {
                 // I1-state: gap open (M→I1) or gap extend (I1→I1)
-                let ins_open = bt_affine_ins1_open(wf_components, slab, score - o1_plus_e1, k);
+                let (ins_open, _) = bt_open1_pair(wf_components, slab, score - o1_plus_e1, k);
                 let ins_ext = bt_affine_ins1_ext(wf_components, slab, score - e1, k);
 
                 let max_all = ins_open.max(ins_ext);
@@ -859,7 +835,7 @@ pub fn backtrace_affine2p(
             }
             2 => {
                 // D1-state: gap open (M→D1) or gap extend (D1→D1)
-                let del_open = bt_affine_del1_open(wf_components, slab, score - o1_plus_e1, k);
+                let (_, del_open) = bt_open1_pair(wf_components, slab, score - o1_plus_e1, k);
                 let del_ext = bt_affine_del1_ext(wf_components, slab, score - e1, k);
 
                 let max_all = del_open.max(del_ext);
@@ -886,7 +862,7 @@ pub fn backtrace_affine2p(
             }
             3 => {
                 // I2-state: gap open (M→I2) or gap extend (I2→I2)
-                let ins_open = bt_affine_ins2_open(wf_components, slab, score - o2_plus_e2, k);
+                let (ins_open, _) = bt_open2_pair(wf_components, slab, score - o2_plus_e2, k);
                 let ins_ext = bt_affine_ins2_ext(wf_components, slab, score - e2, k);
 
                 let max_all = ins_open.max(ins_ext);
@@ -914,7 +890,7 @@ pub fn backtrace_affine2p(
             }
             4 => {
                 // D2-state: gap open (M→D2) or gap extend (D2→D2)
-                let del_open = bt_affine_del2_open(wf_components, slab, score - o2_plus_e2, k);
+                let (_, del_open) = bt_open2_pair(wf_components, slab, score - o2_plus_e2, k);
                 let del_ext = bt_affine_del2_ext(wf_components, slab, score - e2, k);
 
                 let max_all = del_open.max(del_ext);

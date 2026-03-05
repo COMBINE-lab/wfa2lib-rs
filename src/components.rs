@@ -192,10 +192,9 @@ impl WavefrontComponents {
     pub fn get_m_idx(&self, score: usize) -> WavefrontIdx {
         if self.memory_modular {
             unsafe { *self.mwavefronts.get_unchecked(score % self.max_score_scope) }
-        } else if score < self.mwavefronts.len() {
-            unsafe { *self.mwavefronts.get_unchecked(score) }
         } else {
-            WAVEFRONT_IDX_NONE
+            // SAFETY: Vecs pre-sized to upper-bound score by resize()/compute_dimensions().
+            unsafe { *self.mwavefronts.get_unchecked(score) }
         }
     }
 
@@ -203,27 +202,20 @@ impl WavefrontComponents {
     #[inline(always)]
     pub fn set_m_idx(&mut self, score: usize, idx: WavefrontIdx) {
         if self.memory_modular {
-            self.mwavefronts[score % self.max_score_scope] = idx;
+            unsafe { *self.mwavefronts.get_unchecked_mut(score % self.max_score_scope) = idx; }
         } else {
-            if score >= self.mwavefronts.len() {
-                self.mwavefronts.resize(score + 1, WAVEFRONT_IDX_NONE);
-            }
-            self.mwavefronts[score] = idx;
+            // SAFETY: Vecs pre-sized to upper-bound score by resize()/compute_dimensions().
+            unsafe { *self.mwavefronts.get_unchecked_mut(score) = idx; }
         }
     }
 
     /// Get the wavefront index for I1-wavefronts at a given score.
     #[inline(always)]
     pub fn get_i1_idx(&self, score: usize) -> WavefrontIdx {
-        if self.i1wavefronts.is_empty() {
-            return WAVEFRONT_IDX_NONE;
-        }
         if self.memory_modular {
             unsafe { *self.i1wavefronts.get_unchecked(score % self.max_score_scope) }
-        } else if score < self.i1wavefronts.len() {
-            unsafe { *self.i1wavefronts.get_unchecked(score) }
         } else {
-            WAVEFRONT_IDX_NONE
+            unsafe { *self.i1wavefronts.get_unchecked(score) }
         }
     }
 
@@ -231,27 +223,19 @@ impl WavefrontComponents {
     #[inline(always)]
     pub fn set_i1_idx(&mut self, score: usize, idx: WavefrontIdx) {
         if self.memory_modular {
-            self.i1wavefronts[score % self.max_score_scope] = idx;
+            unsafe { *self.i1wavefronts.get_unchecked_mut(score % self.max_score_scope) = idx; }
         } else {
-            if score >= self.i1wavefronts.len() {
-                self.i1wavefronts.resize(score + 1, WAVEFRONT_IDX_NONE);
-            }
-            self.i1wavefronts[score] = idx;
+            unsafe { *self.i1wavefronts.get_unchecked_mut(score) = idx; }
         }
     }
 
     /// Get the wavefront index for D1-wavefronts at a given score.
     #[inline(always)]
     pub fn get_d1_idx(&self, score: usize) -> WavefrontIdx {
-        if self.d1wavefronts.is_empty() {
-            return WAVEFRONT_IDX_NONE;
-        }
         if self.memory_modular {
             unsafe { *self.d1wavefronts.get_unchecked(score % self.max_score_scope) }
-        } else if score < self.d1wavefronts.len() {
-            unsafe { *self.d1wavefronts.get_unchecked(score) }
         } else {
-            WAVEFRONT_IDX_NONE
+            unsafe { *self.d1wavefronts.get_unchecked(score) }
         }
     }
 
@@ -259,27 +243,19 @@ impl WavefrontComponents {
     #[inline(always)]
     pub fn set_d1_idx(&mut self, score: usize, idx: WavefrontIdx) {
         if self.memory_modular {
-            self.d1wavefronts[score % self.max_score_scope] = idx;
+            unsafe { *self.d1wavefronts.get_unchecked_mut(score % self.max_score_scope) = idx; }
         } else {
-            if score >= self.d1wavefronts.len() {
-                self.d1wavefronts.resize(score + 1, WAVEFRONT_IDX_NONE);
-            }
-            self.d1wavefronts[score] = idx;
+            unsafe { *self.d1wavefronts.get_unchecked_mut(score) = idx; }
         }
     }
 
     /// Get the wavefront index for I2-wavefronts at a given score.
     #[inline(always)]
     pub fn get_i2_idx(&self, score: usize) -> WavefrontIdx {
-        if self.i2wavefronts.is_empty() {
-            return WAVEFRONT_IDX_NONE;
-        }
         if self.memory_modular {
             unsafe { *self.i2wavefronts.get_unchecked(score % self.max_score_scope) }
-        } else if score < self.i2wavefronts.len() {
-            unsafe { *self.i2wavefronts.get_unchecked(score) }
         } else {
-            WAVEFRONT_IDX_NONE
+            unsafe { *self.i2wavefronts.get_unchecked(score) }
         }
     }
 
@@ -287,27 +263,19 @@ impl WavefrontComponents {
     #[inline(always)]
     pub fn set_i2_idx(&mut self, score: usize, idx: WavefrontIdx) {
         if self.memory_modular {
-            self.i2wavefronts[score % self.max_score_scope] = idx;
+            unsafe { *self.i2wavefronts.get_unchecked_mut(score % self.max_score_scope) = idx; }
         } else {
-            if score >= self.i2wavefronts.len() {
-                self.i2wavefronts.resize(score + 1, WAVEFRONT_IDX_NONE);
-            }
-            self.i2wavefronts[score] = idx;
+            unsafe { *self.i2wavefronts.get_unchecked_mut(score) = idx; }
         }
     }
 
     /// Get the wavefront index for D2-wavefronts at a given score.
     #[inline(always)]
     pub fn get_d2_idx(&self, score: usize) -> WavefrontIdx {
-        if self.d2wavefronts.is_empty() {
-            return WAVEFRONT_IDX_NONE;
-        }
         if self.memory_modular {
             unsafe { *self.d2wavefronts.get_unchecked(score % self.max_score_scope) }
-        } else if score < self.d2wavefronts.len() {
-            unsafe { *self.d2wavefronts.get_unchecked(score) }
         } else {
-            WAVEFRONT_IDX_NONE
+            unsafe { *self.d2wavefronts.get_unchecked(score) }
         }
     }
 
@@ -315,12 +283,9 @@ impl WavefrontComponents {
     #[inline(always)]
     pub fn set_d2_idx(&mut self, score: usize, idx: WavefrontIdx) {
         if self.memory_modular {
-            self.d2wavefronts[score % self.max_score_scope] = idx;
+            unsafe { *self.d2wavefronts.get_unchecked_mut(score % self.max_score_scope) = idx; }
         } else {
-            if score >= self.d2wavefronts.len() {
-                self.d2wavefronts.resize(score + 1, WAVEFRONT_IDX_NONE);
-            }
-            self.d2wavefronts[score] = idx;
+            unsafe { *self.d2wavefronts.get_unchecked_mut(score) = idx; }
         }
     }
 
@@ -524,14 +489,11 @@ mod tests {
     }
 
     #[test]
-    fn test_dynamic_resize_non_modular() {
+    fn test_access_within_bounds_non_modular() {
         let penalties = WavefrontPenalties::new_edit();
         let mut comp = WavefrontComponents::new(10, 10, &penalties, false, false);
-        // Initially sized for small sequences
-        let initial_len = comp.mwavefronts.len();
-
-        // Set at a score beyond initial length — should auto-extend
-        comp.set_m_idx(initial_len + 5, 99);
-        assert_eq!(comp.get_m_idx(initial_len + 5), 99);
+        // Pre-sized to max(10,10)+1 = 11 slots
+        comp.set_m_idx(5, 99);
+        assert_eq!(comp.get_m_idx(5), 99);
     }
 }
