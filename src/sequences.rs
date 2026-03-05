@@ -73,6 +73,15 @@ pub fn encode_packed2bits(ascii: &[u8]) -> Vec<u8> {
     result
 }
 
+/// Pre-computed raw pointer pair for the extend kernel.
+/// Adjacent fields enable `ldp` (load pair) on aarch64.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SequencePtrs {
+    pub pattern: *const u8,
+    pub text: *const u8,
+}
+
 /// Encapsulates input sequences for alignment.
 pub struct WavefrontSequences {
     /// Current mode.
@@ -105,6 +114,10 @@ pub struct WavefrontSequences {
     pattern_eos_saved: u8,
     text_eos_saved: u8,
 
+    /// Cached raw pointer pair for fast extend access.
+    /// Updated whenever pattern_offset or text_offset changes.
+    ptrs: SequencePtrs,
+
     /// Custom match function for Lambda mode.
     match_funct: Option<Box<dyn Fn(i32, i32) -> bool>>,
 }
@@ -128,6 +141,10 @@ impl WavefrontSequences {
             text_length: 0,
             pattern_eos_saved: WF_SEQUENCES_PATTERN_EOS,
             text_eos_saved: WF_SEQUENCES_TEXT_EOS,
+            ptrs: SequencePtrs {
+                pattern: std::ptr::null(),
+                text: std::ptr::null(),
+            },
             match_funct: None,
         }
     }
@@ -184,6 +201,8 @@ impl WavefrontSequences {
 
         self.pattern_eos_saved = self.seq_buffer[self.pattern_offset + plen];
         self.text_eos_saved = self.seq_buffer[self.text_offset + tlen];
+
+        self.update_ptrs();
     }
 
     /// Initialize with packed 2-bit DNA sequences.
@@ -307,6 +326,23 @@ impl WavefrontSequences {
         self.pattern_length = pattern_end - pattern_begin;
         self.text_begin = text_begin;
         self.text_length = text_end - text_begin;
+
+        if self.mode != SequenceMode::Lambda {
+            self.update_ptrs();
+        }
+    }
+
+    /// Get the cached raw pointer pair (pattern, text) for fast extend access.
+    #[inline(always)]
+    pub fn ptrs(&self) -> SequencePtrs {
+        self.ptrs
+    }
+
+    /// Update cached raw pointers from current offsets.
+    fn update_ptrs(&mut self) {
+        let base = self.seq_buffer.as_ptr();
+        self.ptrs.pattern = unsafe { base.add(self.pattern_offset) };
+        self.ptrs.text = unsafe { base.add(self.text_offset) };
     }
 }
 

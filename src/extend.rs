@@ -23,8 +23,9 @@ use crate::wavefront::Wavefront;
 pub fn extend_matches_packed_end2end(sequences: &WavefrontSequences, wf: &mut Wavefront) {
     let lo = wf.lo;
     let hi = wf.hi;
-    let pattern_base = sequences.pattern_ptr().as_ptr();
-    let text_base = sequences.text_ptr().as_ptr();
+    let ptrs = sequences.ptrs();
+    let pattern_base = ptrs.pattern;
+    let text_base = ptrs.text;
 
     // SAFETY: Bounds guaranteed by caller (lo/hi within wavefront range).
     // Sentinels ('!' vs '?') guarantee termination. 64-byte padding
@@ -73,8 +74,9 @@ pub fn extend_matches_packed_end2end_max(
 ) -> WfOffset {
     let lo = wf.lo;
     let hi = wf.hi;
-    let pattern_base = sequences.pattern_ptr().as_ptr();
-    let text_base = sequences.text_ptr().as_ptr();
+    let ptrs = sequences.ptrs();
+    let pattern_base = ptrs.pattern;
+    let text_base = ptrs.text;
     let mut max_antidiag: WfOffset = 0;
 
     // SAFETY: Same as extend_matches_packed_end2end.
@@ -129,8 +131,9 @@ pub fn extend_matches_packed_endsfree(
 ) -> Option<(i32, WfOffset)> {
     let lo = wf.lo;
     let hi = wf.hi;
-    let pattern_base = sequences.pattern_ptr().as_ptr();
-    let text_base = sequences.text_ptr().as_ptr();
+    let ptrs = sequences.ptrs();
+    let pattern_base = ptrs.pattern;
+    let text_base = ptrs.text;
     let pattern_length = sequences.pattern_length;
     let text_length = sequences.text_length;
 
