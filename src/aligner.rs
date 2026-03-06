@@ -438,8 +438,14 @@ impl<const N: usize> WavefrontAligner<N> {
         // Resize components for sequence dimensions
         self.wf_components.resize(plen, tlen, &self.penalties);
 
-        // Clear slab
-        self.wavefront_slab.clear();
+        // CIGAR (non-modular): reap wavefronts to free list without arena reset —
+        // offset arrays are reused in-place next alignment (zero-alloc steady state).
+        // Score-only (modular): full clear; circular window already handles reuse.
+        if score_only {
+            self.wavefront_slab.clear();
+        } else {
+            self.wavefront_slab.reap_cigar();
+        }
 
         // Pre-size slab to avoid Vec reallocations that would invalidate stored *mut Wavefront ptrs.
         // In CIGAR mode: reserve for all wavefronts across all scores.
@@ -1654,7 +1660,11 @@ impl<const N: usize> WavefrontAligner<N> {
         }
 
         self.wf_components.resize(plen, tlen, &self.penalties);
-        self.wavefront_slab.clear();
+        if self.wf_components.memory_modular {
+            self.wavefront_slab.clear();
+        } else {
+            self.wavefront_slab.reap_cigar();
+        }
 
         // Pre-size slab to avoid Vec reallocations that would invalidate stored *mut Wavefront ptrs.
         {

@@ -15,21 +15,24 @@ This implementation covers the full WFA feature set:
 - **BiWFA**: bidirectional WFA for O(s) memory alignment with full CIGAR output
 - **Heuristics**: WF-adaptive, X-drop, Z-drop, static banding, and adaptive banding for pruning divergent sequences
 - **Sequence representations**: ASCII byte sequences, packed 2-bit DNA encoding, and a lambda callback interface for custom sequence access
-- **SIMD acceleration**: NEON-vectorized compute kernels on aarch64 (4 diagonals per iteration) with scalar fallback on other architectures
+- **SIMD acceleration**: NEON-vectorized compute kernels on aarch64 (4 diagonals/iteration), AVX2 on x86_64 (8 diagonals/iteration), with scalar fallback
 - **Score and alignment**: score-only mode for speed, or full CIGAR traceback with support for match rewards via Eizenga's formula
 
 ## Performance
 
-Benchmarked against the C reference implementation (WFA2-lib) on Apple Silicon (M-series):
+Benchmarked against the C reference implementation (WFA2-lib) on Apple Silicon (M-series), 50,000 sequence pairs of 1000 bp at 5% divergence:
 
-| Benchmark | Ratio vs C |
-|---|---|
-| Edit distance | 1.49x |
-| Gap-affine (CIGAR) | 1.34x |
-| Gap-affine (score-only) | 1.27x |
-| BiWFA | 1.33x |
+| Benchmark | Rust vs C | Notes |
+|---|---|---|
+| Edit distance (score) | **0.57x** | 1.75× faster (NEON SIMD) |
+| Gap-linear (score) | **0.69x** | 1.45× faster |
+| Gap-affine (score) | **0.90x** | 1.11× faster |
+| Gap-affine (CIGAR) | **0.93x** | 1.08× faster |
+| BiWFA (ultralow memory) | **0.90x** | 1.12× faster |
+| Gap-affine 2-piece (score) | 1.09x | |
+| Gap-affine 2-piece (CIGAR) | 1.10x | |
 
-The compute and extend kernels are at or near parity with C. The remaining gap is primarily due to allocator overhead (C uses a bump/arena allocator vs. individual `Vec` allocations in Rust).
+Ratio < 1.0 means Rust is faster. All modes except gap-affine 2-piece are faster than C. Key optimizations include NEON/AVX2 SIMD vectorization, arena bump allocation matching C's `mm_allocator` pattern, wavefront reuse between alignments, and blockwise 64-bit sequence extension.
 
 ## Building
 
@@ -42,7 +45,7 @@ cargo build
 # Optimized release build (recommended)
 RUSTFLAGS="-C target-cpu=native" cargo build --release
 
-# Run tests (215 tests: 197 unit + 18 integration)
+# Run tests (228 tests: 210 unit + 18 integration)
 cargo test
 ```
 
@@ -111,7 +114,8 @@ src/
   sequences.rs        # Sequence representations (ASCII, packed 2-bit, lambda)
   wavefront.rs        # Wavefront data structure
   wavefront_set.rs    # Grouped wavefront sets (M, I, D components)
-  slab.rs             # Wavefront memory pool
+  slab.rs             # Wavefront memory pool with arena allocation
+  arena.rs            # Byte-oriented bump allocator for wavefront arrays
   compute/            # WFA compute kernels (edit, linear, affine, affine2p)
   extend.rs           # Wavefront extend with SIMD acceleration
   backtrace.rs        # CIGAR traceback from wavefronts

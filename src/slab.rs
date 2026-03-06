@@ -1,11 +1,22 @@
-//! Wavefront slab allocator for fast pre-allocated wavefront memory management.
+//! Wavefront slab allocator with arena-backed offset arrays.
 //!
-//! The slab owns all wavefronts and recycles them through a free list.
-//! Two modes are supported:
-//! - `Reuse`: keeps all wavefronts, grows slab size dynamically
-//! - `Tight`: reaps wavefronts when size changes, keeps only init-sized ones
+//! Wavefront offset arrays are allocated from a `ByteArena` bump allocator
+//! instead of per-wavefront `alloc()`. This eliminates malloc/free overhead
+//! for offset storage, matching C's mm_allocator bump pattern.
+//!
+//! Backtrace arrays (bt_pcigar, bt_prev) use individual `alloc_zeroed()` calls:
+//! the OS can supply demand-zero pages rather than requiring explicit writes to
+//! dirty arena memory, which is faster for the large bt arrays in CIGAR mode.
+//!
+//! Wavefront structs remain in a `Vec<Wavefront>` for dense packing:
+//! ~56 bytes each × N wavefronts fits in L2 cache, keeping struct field access
+//! fast for wavefront look-backs up to O2+E2=25 diagonals back in affine2p.
+//!
+//! Two modes:
+//! - `Reuse`: keeps wavefronts of the current size in a free list.
+//! - `Tight`: only reuses exact-init-sized wavefronts; others are dead space.
 
-use crate::arena::OffsetArena;
+use crate::arena::ByteArena;
 use crate::offset::wavefront_length;
 use crate::wavefront::{Wavefront, WavefrontStatus};
 
@@ -36,31 +47,33 @@ pub struct WavefrontSlab {
     init_wf_length: i32,
     /// Current wavefront element count (may grow in Reuse mode).
     current_wf_length: i32,
-    /// All wavefronts owned by this slab.
+    /// All wavefronts owned by this slab (dense Vec for L2 cache locality).
     wavefronts: Vec<Wavefront>,
     /// Indices of free wavefronts (stack).
     free_list: Vec<WavefrontIdx>,
     /// Total memory used in bytes.
     memory_used: u64,
-    /// Arena for wavefront offset arrays (contiguous bump allocation).
-    arena: OffsetArena,
+    /// Arena for all per-wavefront arrays (offsets, bt_pcigar, bt_prev). No zeroing.
+    arena: ByteArena,
 }
 
 impl WavefrontSlab {
     /// Create a new slab.
     pub fn new(init_wf_length: i32, allocate_backtrace: bool, slab_mode: SlabMode) -> Self {
-        // Initial arena: enough for ~500 wavefronts at init size.
-        // Large initial chunk avoids chunk splits in CIGAR mode.
-        let arena_capacity = (init_wf_length as usize) * 500;
+        // Per-wavefront arena bytes: offsets + bt_pcigar + bt_prev (all arena-backed, no zeroing).
+        let arrays_per_wf = if allocate_backtrace { 3 } else { 1 };
+        let bytes_per_wf = (init_wf_length as usize) * 4 * arrays_per_wf;
+        // Initial chunk sized for ~500 wavefronts.
+        let arena_capacity = (bytes_per_wf * 500).max(65536);
         Self {
             allocate_backtrace,
             slab_mode,
             init_wf_length,
             current_wf_length: init_wf_length,
-            wavefronts: Vec::with_capacity(100),
-            free_list: Vec::with_capacity(100),
+            wavefronts: Vec::with_capacity(128),
+            free_list: Vec::with_capacity(32),
             memory_used: 0,
-            arena: OffsetArena::new(arena_capacity.max(4096)),
+            arena: ByteArena::new(arena_capacity),
         }
     }
 
@@ -122,7 +135,6 @@ impl WavefrontSlab {
     }
 
     /// Reuse an existing wavefront in-place (skip free-list round-trip).
-    /// Returns the same index after reinitializing the wavefront.
     #[inline(always)]
     pub fn reuse_inplace(&mut self, idx: WavefrontIdx, min_lo: i32, max_hi: i32) {
         let wf = unsafe { self.wavefronts.get_unchecked_mut(idx) };
@@ -130,9 +142,7 @@ impl WavefrontSlab {
         wf.status = WavefrontStatus::Busy;
     }
 
-    /// Reuse an existing wavefront or allocate a new one.
-    /// If `old_idx` is valid, reuses it in-place (avoids free-list round-trip).
-    /// Otherwise allocates from the free list or creates new.
+    /// Reuse an existing wavefront or allocate a new one (index-based).
     #[inline(always)]
     pub fn reuse_or_allocate(
         &mut self,
@@ -152,8 +162,9 @@ impl WavefrontSlab {
     pub fn free(&mut self, idx: WavefrontIdx) {
         let wf_length = self.wavefronts[idx].wf_elements_allocated;
 
+        // Use >= for Reuse: oversized wavefronts can serve smaller future requests.
         let repurpose_reuse =
-            self.slab_mode == SlabMode::Reuse && wf_length == self.current_wf_length;
+            self.slab_mode == SlabMode::Reuse && wf_length >= self.current_wf_length;
         let repurpose_tight = self.slab_mode == SlabMode::Tight && wf_length == self.init_wf_length;
 
         if repurpose_reuse || repurpose_tight {
@@ -163,6 +174,29 @@ impl WavefrontSlab {
             self.memory_used -= self.wavefronts[idx].get_size();
             self.wavefronts[idx].status = WavefrontStatus::Deallocated;
         }
+    }
+
+    /// Reap all wavefronts to the free list without resetting the arena.
+    ///
+    /// Equivalent to C's `wavefront_slab_reap()`. Puts all live wavefronts on
+    /// the free list WITHOUT resetting `current_wf_length` or the arena. Since
+    /// `current_wf_length` is preserved, the next call to `ensure_min_length`
+    /// skips `reap_free()` and `allocate()` directly pops from the free list —
+    /// near-zero allocation overhead in steady state (alignment 2+).
+    ///
+    /// Use this instead of `clear()` for CIGAR (non-modular) mode.
+    pub fn reap_cigar(&mut self) {
+        // Do NOT reset current_wf_length: wavefronts on the free list are already
+        // sized at current_wf_length, so ensure_min_length will skip reap_free().
+        self.free_list.clear();
+        for (i, wf) in self.wavefronts.iter_mut().enumerate() {
+            if wf.status != WavefrontStatus::Deallocated {
+                wf.status = WavefrontStatus::Free;
+                self.free_list.push(i);
+            }
+        }
+        // Arena NOT reset: offset/bt arrays remain valid; compute kernels
+        // write before read so no zeroing is needed.
     }
 
     /// Reset to initial size and repurpose all wavefronts.
@@ -175,23 +209,20 @@ impl WavefrontSlab {
         self.arena.reset();
     }
 
-    /// Clear the slab according to its mode. Resets the arena.
+    /// Clear the slab. Resets the arena (invalidates all offset/bt pointers).
     pub fn clear(&mut self) {
-        // Drop all wavefronts (arena-backed offsets will NOT be dealloc'd).
+        // Drop all wavefronts. arena_backed and bt_arena_backed are both true,
+        // so Wavefront::drop() skips all dealloc — the arena reset handles it.
         self.wavefronts.clear();
         self.free_list.clear();
         self.memory_used = 0;
         self.arena.reset();
-        match self.slab_mode {
-            SlabMode::Reuse => {}
-            SlabMode::Tight => {
-                self.current_wf_length = self.init_wf_length;
-            }
+        if self.slab_mode == SlabMode::Tight {
+            self.current_wf_length = self.init_wf_length;
         }
     }
 
-    /// Ensure the slab's current wavefront length is at least large enough
-    /// to cover the given diagonal range.
+    /// Ensure the slab's current wavefront length covers the given diagonal range.
     pub fn ensure_min_length(&mut self, min_lo: i32, max_hi: i32) {
         let wf_length = wavefront_length(min_lo, max_hi);
         if wf_length > self.current_wf_length {
@@ -217,7 +248,8 @@ impl WavefrontSlab {
     ///
     /// # Safety
     /// The caller must ensure that no two mutable references to the same
-    /// wavefront exist simultaneously.
+    /// wavefront exist simultaneously. The Vec must not be reallocated
+    /// while this pointer is live — call `reserve()` first.
     #[inline(always)]
     pub unsafe fn get_raw_mut(&mut self, idx: WavefrontIdx) -> *mut Wavefront {
         unsafe { self.wavefronts.as_mut_ptr().add(idx) }
@@ -319,27 +351,31 @@ impl WavefrontSlab {
         idx
     }
 
-    /// Remove deallocated and free wavefronts (Reuse mode reap).
-    /// With arena, keep busy wavefronts and their offset pointers (still valid).
-    /// Dead space from freed wavefronts is reclaimed on the next clear().
+    /// Filter the free list after a `current_wf_length` growth.
+    ///
+    /// Busy wavefronts are left in place (indices preserved — stored *mut Wavefront
+    /// pointers in wf_components remain valid). Free wavefronts large enough for
+    /// the new `current_wf_length` are kept and re-added to the free list;
+    /// undersized ones are marked Deallocated. No Vec compaction is performed.
     fn reap_free(&mut self) {
+        let current = self.current_wf_length;
         self.free_list.clear();
-        let mut valid_idx = 0;
-        for i in 0..self.wavefronts.len() {
-            if self.wavefronts[i].status == WavefrontStatus::Busy {
-                if valid_idx != i {
-                    self.wavefronts.swap(valid_idx, i);
+        for (i, wf) in self.wavefronts.iter_mut().enumerate() {
+            match wf.status {
+                WavefrontStatus::Busy => {} // keep in place; index unchanged
+                WavefrontStatus::Free => {
+                    if wf.wf_elements_allocated >= current {
+                        self.free_list.push(i); // large enough — keep on free list
+                    } else {
+                        wf.status = WavefrontStatus::Deallocated; // too small — discard
+                    }
                 }
-                valid_idx += 1;
+                WavefrontStatus::Deallocated => {} // already dead
             }
-            // Free and Deallocated wavefronts: metadata dropped, offset memory
-            // becomes arena dead space (reclaimed on arena.reset()).
         }
-        self.wavefronts.truncate(valid_idx);
     }
 
     /// Repurpose wavefronts matching current_wf_length; remove others.
-    /// Offset pointers remain valid in the arena (not reset here).
     fn reap_repurpose(&mut self) {
         self.free_list.clear();
         let current_wf_length = self.current_wf_length;
@@ -466,6 +502,19 @@ mod tests {
         let idx = slab.allocate(-5, 5);
         let wf = slab.get(idx);
         assert!(wf.has_backtrace());
+    }
+
+    #[test]
+    fn test_bt_arena_backed() {
+        // CIGAR mode: bt arrays must come from arena, not individual alloc_zeroed.
+        let mut slab = WavefrontSlab::new(20, true, SlabMode::Reuse);
+        let idx = slab.allocate(-5, 5);
+        let wf = slab.get_mut(idx);
+        // bt arrays should be arena-backed (not heap)
+        assert!(wf.has_backtrace());
+        // Write and read to verify bt arrays are valid
+        wf.set_bt_pcigar(0, 0xDEAD);
+        assert_eq!(wf.get_bt_pcigar(0), 0xDEAD);
     }
 
     #[test]
