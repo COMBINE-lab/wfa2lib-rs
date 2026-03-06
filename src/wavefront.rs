@@ -8,8 +8,9 @@
 //! for better cache utilization when accessing many wavefronts per step.
 
 use std::alloc::{Layout, alloc, alloc_zeroed, dealloc};
+use std::ptr::null_mut;
 
-use crate::arena::OffsetArena;
+use crate::arena::ByteArena;
 use crate::offset::{OFFSET_NULL, WfOffset};
 use crate::pcigar::{PCIGAR_NULL, Pcigar};
 
@@ -72,6 +73,10 @@ pub struct Wavefront {
     pub status: WavefrontStatus,
     /// Whether offset array is arena-backed (skip dealloc on drop).
     arena_backed: bool,
+    /// Whether bt_pcigar and bt_prev arrays are arena-backed (skip dealloc on drop).
+    /// True when allocated via `allocate_from_arena` with `allocate_backtrace=true`.
+    bt_arena_backed: bool,
+    // Layout: 3×ptr(24B) + 7×i32(28B) + 4×bool(4B) = 56B exactly (no padding).
 }
 
 // Raw pointers are not Send/Sync by default, but our wavefronts are
@@ -88,7 +93,8 @@ impl Drop for Wavefront {
                 dealloc(self.offsets_ptr as *mut u8, layout);
             }
         }
-        if !self.bt_pcigar_ptr.is_null() {
+        // Arena-backed bt arrays are freed when the arena resets — skip dealloc.
+        if !self.bt_arena_backed && !self.bt_pcigar_ptr.is_null() {
             unsafe {
                 let layout = Layout::array::<Pcigar>(size).unwrap();
                 dealloc(self.bt_pcigar_ptr as *mut u8, layout);
@@ -123,7 +129,7 @@ impl Wavefront {
                 (p, b)
             }
         } else {
-            (std::ptr::null_mut(), std::ptr::null_mut())
+            (null_mut(), null_mut())
         };
         Self {
             offsets_ptr,
@@ -139,29 +145,34 @@ impl Wavefront {
             wf_elements_init_min: 0,
             wf_elements_init_max: 0,
             arena_backed: false,
+            bt_arena_backed: false,
         }
     }
 
-    /// Allocate a wavefront with offset array from the arena (bump allocator).
-    /// The offset array lives in the arena's contiguous buffer instead of
-    /// an individual heap allocation, providing O(1) allocation and spatial locality.
-    /// Backtrace arrays remain heap-allocated (only used in CIGAR mode).
+    /// Allocate a wavefront with all arrays from the arena (bump allocator).
+    ///
+    /// All three arrays (offsets, bt_pcigar, bt_prev) live in the arena's
+    /// contiguous buffer. None are zeroed — matching C's `mm_allocator_calloc`
+    /// with `zero_mem=false`. Correctness is maintained because:
+    /// - Offset positions [lo,hi] are always written by compute kernels before read.
+    /// - bt positions [lo,hi] are always written by CIGAR compute kernels before
+    ///   the backtrace reads them. Positions outside [lo,hi] are never accessed.
+    /// - `init_null()` and `init_ends_lower/higher()` explicitly fill any
+    ///   null/extended positions including their bt values.
     pub fn allocate_from_arena(
-        arena: &mut OffsetArena,
+        arena: &mut ByteArena,
         wf_elements_allocated: i32,
         allocate_backtrace: bool,
     ) -> Self {
         let size = wf_elements_allocated as usize;
-        let offsets_ptr = arena.alloc(size);
+        let offsets_ptr = arena.alloc_bytes(size * 4) as *mut WfOffset;
         let (bt_pcigar_ptr, bt_prev_ptr) = if allocate_backtrace {
-            unsafe {
-                let p = alloc_zeroed(Layout::array::<Pcigar>(size).unwrap()) as *mut Pcigar;
-                let b =
-                    alloc_zeroed(Layout::array::<BtBlockIdx>(size).unwrap()) as *mut BtBlockIdx;
-                (p, b)
-            }
+            // No zeroing needed — compute kernels write before backtrace reads.
+            let p = arena.alloc_bytes(size * 4) as *mut Pcigar;
+            let b = arena.alloc_bytes(size * 4) as *mut BtBlockIdx;
+            (p, b)
         } else {
-            (std::ptr::null_mut(), std::ptr::null_mut())
+            (null_mut(), null_mut())
         };
         Self {
             offsets_ptr,
@@ -177,13 +188,61 @@ impl Wavefront {
             wf_elements_init_min: 0,
             wf_elements_init_max: 0,
             arena_backed: true,
+            bt_arena_backed: allocate_backtrace,
+        }
+    }
+
+    /// Initialize a `Wavefront` at an arena-allocated address.
+    ///
+    /// `ptr` must point to a block allocated by `ByteArena::alloc_bytes()` with
+    /// at least `size_of::<Wavefront>() + wf_elements_allocated * size_of::<WfOffset>()`
+    /// bytes and 8-byte alignment. The offset array immediately follows the struct
+    /// at `ptr.add(1) as *mut WfOffset`.
+    ///
+    /// # Safety
+    /// `ptr` must be valid, writable, 8-byte aligned, and followed by
+    /// at least `wf_elements_allocated` `WfOffset` (i32) slots.
+    pub unsafe fn new_at_ptr(
+        ptr: *mut Wavefront,
+        wf_elements_allocated: i32,
+        allocate_backtrace: bool,
+    ) {
+        let size = wf_elements_allocated as usize;
+        // Offset array immediately follows the struct in the same arena block.
+        let offsets_ptr = unsafe { ptr.add(1) as *mut WfOffset };
+        let (bt_pcigar_ptr, bt_prev_ptr) = if allocate_backtrace {
+            unsafe {
+                let p = alloc_zeroed(Layout::array::<Pcigar>(size).unwrap()) as *mut Pcigar;
+                let b = alloc_zeroed(Layout::array::<BtBlockIdx>(size).unwrap()) as *mut BtBlockIdx;
+                (p, b)
+            }
+        } else {
+            (null_mut(), null_mut())
+        };
+        unsafe {
+            ptr.write(Wavefront {
+                offsets_ptr,
+                bt_pcigar_ptr,
+                bt_prev_ptr,
+                null: false,
+                lo: 1,
+                hi: -1,
+                base_k: 0,
+                bt_occupancy_max: 0,
+                status: WavefrontStatus::Free,
+                wf_elements_allocated,
+                wf_elements_init_min: 0,
+                wf_elements_init_max: 0,
+                arena_backed: true,
+                bt_arena_backed: false, // new_at_ptr keeps bt as heap (or null)
+            });
         }
     }
 
     /// Resize the wavefront (content is lost). Heap-allocated only.
-    /// Arena-backed wavefronts use `resize_from_arena` instead.
     pub fn resize(&mut self, wf_elements_allocated: i32) {
-        debug_assert!(!self.arena_backed, "use resize_from_arena for arena-backed wavefronts");
+        debug_assert!(!self.arena_backed, "arena-backed wavefronts cannot be resized in place");
+        debug_assert!(!self.bt_arena_backed, "arena-backed bt wavefronts cannot be resized in place");
         let old_size = self.wf_elements_allocated as usize;
         let new_size = wf_elements_allocated as usize;
         self.wf_elements_allocated = wf_elements_allocated;
@@ -196,26 +255,6 @@ impl Wavefront {
             self.offsets_ptr = alloc(Layout::array::<WfOffset>(new_size).unwrap()) as *mut WfOffset;
             // Resize backtrace if present
             if !self.bt_pcigar_ptr.is_null() {
-                dealloc(self.bt_pcigar_ptr as *mut u8, Layout::array::<Pcigar>(old_size).unwrap());
-                dealloc(self.bt_prev_ptr as *mut u8, Layout::array::<BtBlockIdx>(old_size).unwrap());
-                self.bt_pcigar_ptr = alloc_zeroed(Layout::array::<Pcigar>(new_size).unwrap()) as *mut Pcigar;
-                self.bt_prev_ptr = alloc_zeroed(Layout::array::<BtBlockIdx>(new_size).unwrap()) as *mut BtBlockIdx;
-            }
-        }
-    }
-
-    /// Resize an arena-backed wavefront. Old offset region becomes dead space;
-    /// new region allocated from the arena.
-    pub fn resize_from_arena(&mut self, arena: &mut OffsetArena, wf_elements_allocated: i32) {
-        debug_assert!(self.arena_backed);
-        let old_size = self.wf_elements_allocated as usize;
-        let new_size = wf_elements_allocated as usize;
-        self.wf_elements_allocated = wf_elements_allocated;
-        // Old offset region is arena dead space (reclaimed on arena.reset())
-        self.offsets_ptr = arena.alloc(new_size);
-        // Resize backtrace if present (still heap-allocated)
-        if !self.bt_pcigar_ptr.is_null() {
-            unsafe {
                 dealloc(self.bt_pcigar_ptr as *mut u8, Layout::array::<Pcigar>(old_size).unwrap());
                 dealloc(self.bt_prev_ptr as *mut u8, Layout::array::<BtBlockIdx>(old_size).unwrap());
                 self.bt_pcigar_ptr = alloc_zeroed(Layout::array::<Pcigar>(new_size).unwrap()) as *mut Pcigar;
@@ -584,5 +623,37 @@ mod tests {
         slice[(3 - base) as usize] = 42;
 
         assert_eq!(wf.get_offset(3), 42);
+    }
+
+    #[test]
+    fn test_new_at_ptr() {
+        use std::alloc::{Layout, alloc, dealloc};
+        use std::mem::size_of;
+        let n: usize = 11;
+        // Allocate a block large enough for Wavefront + n WfOffsets, 8-aligned.
+        let block_size = size_of::<Wavefront>() + n * size_of::<WfOffset>();
+        let block_size_aligned = (block_size + 7) & !7;
+        let layout = Layout::from_size_align(block_size_aligned, 8).unwrap();
+        let raw = unsafe { alloc(layout) } as *mut Wavefront;
+        assert!(!raw.is_null());
+
+        unsafe { Wavefront::new_at_ptr(raw, n as i32, false); }
+
+        let wf = unsafe { &mut *raw };
+        assert_eq!(wf.wf_elements_allocated, n as i32);
+        assert!(wf.arena_backed);
+        assert!(!wf.null);
+        // offsets_ptr should be immediately after the struct
+        let expected_offsets = unsafe { raw.add(1) as *mut WfOffset };
+        assert_eq!(wf.offsets_ptr, expected_offsets);
+
+        // Can write/read offsets through the wavefront API
+        wf.init(-5, 5);
+        wf.set_offset(0, 42);
+        assert_eq!(wf.get_offset(0), 42);
+
+        // Leak: drop won't free offsets (arena_backed) or bt arrays (null).
+        // Just free the backing block.
+        unsafe { std::mem::forget(std::ptr::read(raw)); dealloc(raw as *mut u8, layout); }
     }
 }
