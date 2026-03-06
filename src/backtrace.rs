@@ -10,7 +10,7 @@ use crate::cigar::Cigar;
 use crate::components::WavefrontComponents;
 use crate::offset::{OFFSET_NULL, wavefront_h, wavefront_v};
 use crate::penalties::{DistanceMetric, WavefrontPenalties};
-use crate::slab::{WAVEFRONT_IDX_NONE, WavefrontSlab};
+use crate::slab::WavefrontSlab;
 
 // Backtrace type constants (packed into low 4 bits of i64).
 // Higher values win ties when offsets are equal.
@@ -43,15 +43,15 @@ fn piggyback_get_type(value: i64) -> i64 {
 
 /// Look up mismatch predecessor: M-wavefront at (score, k), offset + 1.
 #[inline(always)]
-fn bt_misms(wf_components: &WavefrontComponents, slab: &WavefrontSlab, score: i32, k: i32) -> i64 {
+fn bt_misms<const N: usize>(wf_components: &WavefrontComponents<N>, score: i32, k: i32) -> i64 {
     if score < 0 {
         return OFFSET_NULL as i64;
     }
-    let m_idx = wf_components.get_m_idx(score as usize);
-    if m_idx == WAVEFRONT_IDX_NONE {
+    let m_ptr = wf_components.get_m_ptr(score as usize);
+    if m_ptr.is_null() {
         return OFFSET_NULL as i64;
     }
-    let wf = slab.get(m_idx);
+    let wf = unsafe { &*m_ptr };
     if wf.wf_elements_init_min <= k && k <= wf.wf_elements_init_max {
         piggyback_set(wf.get_offset(k) + 1, BT_M)
     } else {
@@ -61,20 +61,19 @@ fn bt_misms(wf_components: &WavefrontComponents, slab: &WavefrontSlab, score: i3
 
 /// Look up insertion predecessor: M-wavefront at (score, k-1), offset + 1.
 #[inline(always)]
-fn bt_ins1_open(
-    wf_components: &WavefrontComponents,
-    slab: &WavefrontSlab,
+fn bt_ins1_open<const N: usize>(
+    wf_components: &WavefrontComponents<N>,
     score: i32,
     k: i32,
 ) -> i64 {
     if score < 0 {
         return OFFSET_NULL as i64;
     }
-    let m_idx = wf_components.get_m_idx(score as usize);
-    if m_idx == WAVEFRONT_IDX_NONE {
+    let m_ptr = wf_components.get_m_ptr(score as usize);
+    if m_ptr.is_null() {
         return OFFSET_NULL as i64;
     }
-    let wf = slab.get(m_idx);
+    let wf = unsafe { &*m_ptr };
     if wf.wf_elements_init_min < k && k - 1 <= wf.wf_elements_init_max {
         piggyback_set(wf.get_offset(k - 1) + 1, BT_I1_OPEN)
     } else {
@@ -84,20 +83,19 @@ fn bt_ins1_open(
 
 /// Look up deletion predecessor: M-wavefront at (score, k+1), offset unchanged.
 #[inline(always)]
-fn bt_del1_open(
-    wf_components: &WavefrontComponents,
-    slab: &WavefrontSlab,
+fn bt_del1_open<const N: usize>(
+    wf_components: &WavefrontComponents<N>,
     score: i32,
     k: i32,
 ) -> i64 {
     if score < 0 {
         return OFFSET_NULL as i64;
     }
-    let m_idx = wf_components.get_m_idx(score as usize);
-    if m_idx == WAVEFRONT_IDX_NONE {
+    let m_ptr = wf_components.get_m_ptr(score as usize);
+    if m_ptr.is_null() {
         return OFFSET_NULL as i64;
     }
-    let wf = slab.get(m_idx);
+    let wf = unsafe { &*m_ptr };
     if wf.wf_elements_init_min <= k + 1 && k < wf.wf_elements_init_max {
         piggyback_set(wf.get_offset(k + 1), BT_D1_OPEN)
     } else {
@@ -122,9 +120,9 @@ fn write_matches(cigar: &mut Cigar, num_matches: i32) {
 /// Walks backwards through all stored M-wavefronts from the alignment endpoint
 /// to reconstruct the full alignment. The CIGAR is built from end to beginning.
 #[allow(clippy::too_many_arguments)]
-pub fn backtrace_linear(
-    wf_components: &WavefrontComponents,
-    slab: &WavefrontSlab,
+pub fn backtrace_linear<const N: usize>(
+    wf_components: &WavefrontComponents<N>,
+    _slab: &WavefrontSlab,
     penalties: &WavefrontPenalties,
     pattern_length: i32,
     text_length: i32,
@@ -168,12 +166,12 @@ pub fn backtrace_linear(
 
         // Look up predecessor offsets (packed with type)
         let misms = if distance_metric != DistanceMetric::Indel {
-            bt_misms(wf_components, slab, mismatch_score, k)
+            bt_misms(wf_components, mismatch_score, k)
         } else {
             OFFSET_NULL as i64
         };
-        let ins = bt_ins1_open(wf_components, slab, gap_score, k);
-        let del = bt_del1_open(wf_components, slab, gap_score, k);
+        let ins = bt_ins1_open(wf_components, gap_score, k);
+        let del = bt_del1_open(wf_components, gap_score, k);
 
         // Take max — higher type wins ties (M > D > I)
         let max_all = misms.max(ins.max(del));
@@ -254,15 +252,15 @@ pub fn backtrace_linear(
 
 /// Look up I1-wavefront at (score, k): returns piggyback(offset, BT_I1_EXT).
 #[inline(always)]
-fn bt_i1_ext(wf_components: &WavefrontComponents, slab: &WavefrontSlab, score: i32, k: i32) -> i64 {
+fn bt_i1_ext<const N: usize>(wf_components: &WavefrontComponents<N>, score: i32, k: i32) -> i64 {
     if score < 0 {
         return OFFSET_NULL as i64;
     }
-    let i1_idx = wf_components.get_i1_idx(score as usize);
-    if i1_idx == WAVEFRONT_IDX_NONE {
+    let i1_ptr = wf_components.get_i1_ptr(score as usize);
+    if i1_ptr.is_null() {
         return OFFSET_NULL as i64;
     }
-    let wf = slab.get(i1_idx);
+    let wf = unsafe { &*i1_ptr };
     if wf.wf_elements_init_min <= k && k <= wf.wf_elements_init_max {
         piggyback_set(wf.get_offset(k), BT_I1_EXT)
     } else {
@@ -272,15 +270,15 @@ fn bt_i1_ext(wf_components: &WavefrontComponents, slab: &WavefrontSlab, score: i
 
 /// Look up D1-wavefront at (score, k): returns piggyback(offset, BT_D1_EXT).
 #[inline(always)]
-fn bt_d1_ext(wf_components: &WavefrontComponents, slab: &WavefrontSlab, score: i32, k: i32) -> i64 {
+fn bt_d1_ext<const N: usize>(wf_components: &WavefrontComponents<N>, score: i32, k: i32) -> i64 {
     if score < 0 {
         return OFFSET_NULL as i64;
     }
-    let d1_idx = wf_components.get_d1_idx(score as usize);
-    if d1_idx == WAVEFRONT_IDX_NONE {
+    let d1_ptr = wf_components.get_d1_ptr(score as usize);
+    if d1_ptr.is_null() {
         return OFFSET_NULL as i64;
     }
-    let wf = slab.get(d1_idx);
+    let wf = unsafe { &*d1_ptr };
     if wf.wf_elements_init_min <= k && k <= wf.wf_elements_init_max {
         piggyback_set(wf.get_offset(k), BT_D1_EXT)
     } else {
@@ -290,22 +288,21 @@ fn bt_d1_ext(wf_components: &WavefrontComponents, slab: &WavefrontSlab, score: i
 
 /// Look up both M→I1 open (k-1, offset+1) and M→D1 open (k+1, offset) from
 /// the same M-wavefront at the given score. Returns (ins1_open, del1_open).
-/// This avoids a redundant get_m_idx + slab.get double-fetch.
+/// This avoids a redundant double-fetch.
 #[inline(always)]
-fn bt_open1_pair(
-    wf_components: &WavefrontComponents,
-    slab: &WavefrontSlab,
+fn bt_open1_pair<const N: usize>(
+    wf_components: &WavefrontComponents<N>,
     score: i32,
     k: i32,
 ) -> (i64, i64) {
     if score < 0 {
         return (OFFSET_NULL as i64, OFFSET_NULL as i64);
     }
-    let m_idx = wf_components.get_m_idx(score as usize);
-    if m_idx == WAVEFRONT_IDX_NONE {
+    let m_ptr = wf_components.get_m_ptr(score as usize);
+    if m_ptr.is_null() {
         return (OFFSET_NULL as i64, OFFSET_NULL as i64);
     }
-    let wf = slab.get(m_idx);
+    let wf = unsafe { &*m_ptr };
     let min = wf.wf_elements_init_min;
     let max = wf.wf_elements_init_max;
 
@@ -324,20 +321,19 @@ fn bt_open1_pair(
 
 /// Affine backtrace: look up I1 extend at (score, k-1), offset + 1.
 #[inline(always)]
-fn bt_affine_ins1_ext(
-    wf_components: &WavefrontComponents,
-    slab: &WavefrontSlab,
+fn bt_affine_ins1_ext<const N: usize>(
+    wf_components: &WavefrontComponents<N>,
     score: i32,
     k: i32,
 ) -> i64 {
     if score < 0 {
         return OFFSET_NULL as i64;
     }
-    let i1_idx = wf_components.get_i1_idx(score as usize);
-    if i1_idx == WAVEFRONT_IDX_NONE {
+    let i1_ptr = wf_components.get_i1_ptr(score as usize);
+    if i1_ptr.is_null() {
         return OFFSET_NULL as i64;
     }
-    let wf = slab.get(i1_idx);
+    let wf = unsafe { &*i1_ptr };
     if wf.wf_elements_init_min < k && k - 1 <= wf.wf_elements_init_max {
         piggyback_set(wf.get_offset(k - 1) + 1, BT_I1_EXT)
     } else {
@@ -347,20 +343,19 @@ fn bt_affine_ins1_ext(
 
 /// Affine backtrace: look up D1 extend at (score, k+1), offset unchanged.
 #[inline(always)]
-fn bt_affine_del1_ext(
-    wf_components: &WavefrontComponents,
-    slab: &WavefrontSlab,
+fn bt_affine_del1_ext<const N: usize>(
+    wf_components: &WavefrontComponents<N>,
     score: i32,
     k: i32,
 ) -> i64 {
     if score < 0 {
         return OFFSET_NULL as i64;
     }
-    let d1_idx = wf_components.get_d1_idx(score as usize);
-    if d1_idx == WAVEFRONT_IDX_NONE {
+    let d1_ptr = wf_components.get_d1_ptr(score as usize);
+    if d1_ptr.is_null() {
         return OFFSET_NULL as i64;
     }
-    let wf = slab.get(d1_idx);
+    let wf = unsafe { &*d1_ptr };
     if wf.wf_elements_init_min <= k + 1 && k < wf.wf_elements_init_max {
         piggyback_set(wf.get_offset(k + 1), BT_D1_EXT)
     } else {
@@ -375,9 +370,9 @@ fn bt_affine_del1_ext(
 /// In I1-state: predecessors are gap open (M→I1) or gap extend (I1→I1).
 /// In D1-state: predecessors are gap open (M→D1) or gap extend (D1→D1).
 #[allow(clippy::too_many_arguments)]
-pub fn backtrace_affine(
-    wf_components: &WavefrontComponents,
-    slab: &WavefrontSlab,
+pub fn backtrace_affine<const N: usize>(
+    wf_components: &WavefrontComponents<N>,
+    _slab: &WavefrontSlab,
     penalties: &WavefrontPenalties,
     pattern_length: i32,
     text_length: i32,
@@ -434,9 +429,9 @@ pub fn backtrace_affine(
         match matrix {
             0 => {
                 // In M-matrix: predecessors are mismatch, I1→M, D1→M
-                let misms = bt_misms(wf_components, slab, score - x, k);
-                let ins_from_i1 = bt_i1_ext(wf_components, slab, score, k);
-                let del_from_d1 = bt_d1_ext(wf_components, slab, score, k);
+                let misms = bt_misms(wf_components, score - x, k);
+                let ins_from_i1 = bt_i1_ext(wf_components, score, k);
+                let del_from_d1 = bt_d1_ext(wf_components, score, k);
 
                 let max_all = misms.max(ins_from_i1.max(del_from_d1));
 
@@ -478,8 +473,8 @@ pub fn backtrace_affine(
             1 => {
                 // In I1-matrix: predecessors are gap open (M→I1) or gap extend (I1→I1)
                 // bt_open1_pair fetches M-wavefront once for both ins_open and del_open
-                let (ins_open, _) = bt_open1_pair(wf_components, slab, score - o_plus_e, k);
-                let ins_ext = bt_affine_ins1_ext(wf_components, slab, score - e, k);
+                let (ins_open, _) = bt_open1_pair(wf_components, score - o_plus_e, k);
+                let ins_ext = bt_affine_ins1_ext(wf_components, score - e, k);
 
                 let max_all = ins_open.max(ins_ext);
 
@@ -511,8 +506,8 @@ pub fn backtrace_affine(
             }
             2 => {
                 // In D1-matrix: predecessors are gap open (M→D1) or gap extend (D1→D1)
-                let (_, del_open) = bt_open1_pair(wf_components, slab, score - o_plus_e, k);
-                let del_ext = bt_affine_del1_ext(wf_components, slab, score - e, k);
+                let (_, del_open) = bt_open1_pair(wf_components, score - o_plus_e, k);
+                let del_ext = bt_affine_del1_ext(wf_components, score - e, k);
 
                 let max_all = del_open.max(del_ext);
 
@@ -577,15 +572,15 @@ pub fn backtrace_affine(
 
 /// Look up I2-wavefront at (score, k): returns piggyback(offset, BT_I2_EXT).
 #[inline(always)]
-fn bt_i2_ext(wf_components: &WavefrontComponents, slab: &WavefrontSlab, score: i32, k: i32) -> i64 {
+fn bt_i2_ext<const N: usize>(wf_components: &WavefrontComponents<N>, score: i32, k: i32) -> i64 {
     if score < 0 {
         return OFFSET_NULL as i64;
     }
-    let i2_idx = wf_components.get_i2_idx(score as usize);
-    if i2_idx == WAVEFRONT_IDX_NONE {
+    let i2_ptr = wf_components.get_i2_ptr(score as usize);
+    if i2_ptr.is_null() {
         return OFFSET_NULL as i64;
     }
-    let wf = slab.get(i2_idx);
+    let wf = unsafe { &*i2_ptr };
     if wf.wf_elements_init_min <= k && k <= wf.wf_elements_init_max {
         piggyback_set(wf.get_offset(k), BT_I2_EXT)
     } else {
@@ -595,15 +590,15 @@ fn bt_i2_ext(wf_components: &WavefrontComponents, slab: &WavefrontSlab, score: i
 
 /// Look up D2-wavefront at (score, k): returns piggyback(offset, BT_D2_EXT).
 #[inline(always)]
-fn bt_d2_ext(wf_components: &WavefrontComponents, slab: &WavefrontSlab, score: i32, k: i32) -> i64 {
+fn bt_d2_ext<const N: usize>(wf_components: &WavefrontComponents<N>, score: i32, k: i32) -> i64 {
     if score < 0 {
         return OFFSET_NULL as i64;
     }
-    let d2_idx = wf_components.get_d2_idx(score as usize);
-    if d2_idx == WAVEFRONT_IDX_NONE {
+    let d2_ptr = wf_components.get_d2_ptr(score as usize);
+    if d2_ptr.is_null() {
         return OFFSET_NULL as i64;
     }
-    let wf = slab.get(d2_idx);
+    let wf = unsafe { &*d2_ptr };
     if wf.wf_elements_init_min <= k && k <= wf.wf_elements_init_max {
         piggyback_set(wf.get_offset(k), BT_D2_EXT)
     } else {
@@ -614,20 +609,19 @@ fn bt_d2_ext(wf_components: &WavefrontComponents, slab: &WavefrontSlab, score: i
 /// Look up both M→I2 open (k-1, offset+1) and M→D2 open (k+1, offset) from
 /// the same M-wavefront at the given score. Returns (ins2_open, del2_open).
 #[inline(always)]
-fn bt_open2_pair(
-    wf_components: &WavefrontComponents,
-    slab: &WavefrontSlab,
+fn bt_open2_pair<const N: usize>(
+    wf_components: &WavefrontComponents<N>,
     score: i32,
     k: i32,
 ) -> (i64, i64) {
     if score < 0 {
         return (OFFSET_NULL as i64, OFFSET_NULL as i64);
     }
-    let m_idx = wf_components.get_m_idx(score as usize);
-    if m_idx == WAVEFRONT_IDX_NONE {
+    let m_ptr = wf_components.get_m_ptr(score as usize);
+    if m_ptr.is_null() {
         return (OFFSET_NULL as i64, OFFSET_NULL as i64);
     }
-    let wf = slab.get(m_idx);
+    let wf = unsafe { &*m_ptr };
     let min = wf.wf_elements_init_min;
     let max = wf.wf_elements_init_max;
 
@@ -646,20 +640,19 @@ fn bt_open2_pair(
 
 /// Affine2p backtrace: look up I2 extend at (score, k-1), offset + 1.
 #[inline(always)]
-fn bt_affine_ins2_ext(
-    wf_components: &WavefrontComponents,
-    slab: &WavefrontSlab,
+fn bt_affine_ins2_ext<const N: usize>(
+    wf_components: &WavefrontComponents<N>,
     score: i32,
     k: i32,
 ) -> i64 {
     if score < 0 {
         return OFFSET_NULL as i64;
     }
-    let i2_idx = wf_components.get_i2_idx(score as usize);
-    if i2_idx == WAVEFRONT_IDX_NONE {
+    let i2_ptr = wf_components.get_i2_ptr(score as usize);
+    if i2_ptr.is_null() {
         return OFFSET_NULL as i64;
     }
-    let wf = slab.get(i2_idx);
+    let wf = unsafe { &*i2_ptr };
     if wf.wf_elements_init_min < k && k - 1 <= wf.wf_elements_init_max {
         piggyback_set(wf.get_offset(k - 1) + 1, BT_I2_EXT)
     } else {
@@ -669,20 +662,19 @@ fn bt_affine_ins2_ext(
 
 /// Affine2p backtrace: look up D2 extend at (score, k+1), offset unchanged.
 #[inline(always)]
-fn bt_affine_del2_ext(
-    wf_components: &WavefrontComponents,
-    slab: &WavefrontSlab,
+fn bt_affine_del2_ext<const N: usize>(
+    wf_components: &WavefrontComponents<N>,
     score: i32,
     k: i32,
 ) -> i64 {
     if score < 0 {
         return OFFSET_NULL as i64;
     }
-    let d2_idx = wf_components.get_d2_idx(score as usize);
-    if d2_idx == WAVEFRONT_IDX_NONE {
+    let d2_ptr = wf_components.get_d2_ptr(score as usize);
+    if d2_ptr.is_null() {
         return OFFSET_NULL as i64;
     }
-    let wf = slab.get(d2_idx);
+    let wf = unsafe { &*d2_ptr };
     if wf.wf_elements_init_min <= k + 1 && k < wf.wf_elements_init_max {
         piggyback_set(wf.get_offset(k + 1), BT_D2_EXT)
     } else {
@@ -694,9 +686,9 @@ fn bt_affine_del2_ext(
 ///
 /// Uses a 5-state machine tracking current matrix type (M, I1, D1, I2, D2).
 #[allow(clippy::too_many_arguments)]
-pub fn backtrace_affine2p(
-    wf_components: &WavefrontComponents,
-    slab: &WavefrontSlab,
+pub fn backtrace_affine2p<const N: usize>(
+    wf_components: &WavefrontComponents<N>,
+    _slab: &WavefrontSlab,
     penalties: &WavefrontPenalties,
     pattern_length: i32,
     text_length: i32,
@@ -755,11 +747,11 @@ pub fn backtrace_affine2p(
         match matrix {
             0 => {
                 // M-state: predecessors are mismatch, I1→M, D1→M, I2→M, D2→M
-                let misms = bt_misms(wf_components, slab, score - x, k);
-                let ins_from_i1 = bt_i1_ext(wf_components, slab, score, k);
-                let del_from_d1 = bt_d1_ext(wf_components, slab, score, k);
-                let ins_from_i2 = bt_i2_ext(wf_components, slab, score, k);
-                let del_from_d2 = bt_d2_ext(wf_components, slab, score, k);
+                let misms = bt_misms(wf_components, score - x, k);
+                let ins_from_i1 = bt_i1_ext(wf_components, score, k);
+                let del_from_d1 = bt_d1_ext(wf_components, score, k);
+                let ins_from_i2 = bt_i2_ext(wf_components, score, k);
+                let del_from_d2 = bt_d2_ext(wf_components, score, k);
 
                 let max_all = misms
                     .max(ins_from_i1)
@@ -807,8 +799,8 @@ pub fn backtrace_affine2p(
             }
             1 => {
                 // I1-state: gap open (M→I1) or gap extend (I1→I1)
-                let (ins_open, _) = bt_open1_pair(wf_components, slab, score - o1_plus_e1, k);
-                let ins_ext = bt_affine_ins1_ext(wf_components, slab, score - e1, k);
+                let (ins_open, _) = bt_open1_pair(wf_components, score - o1_plus_e1, k);
+                let ins_ext = bt_affine_ins1_ext(wf_components, score - e1, k);
 
                 let max_all = ins_open.max(ins_ext);
                 if max_all < 0 {
@@ -835,8 +827,8 @@ pub fn backtrace_affine2p(
             }
             2 => {
                 // D1-state: gap open (M→D1) or gap extend (D1→D1)
-                let (_, del_open) = bt_open1_pair(wf_components, slab, score - o1_plus_e1, k);
-                let del_ext = bt_affine_del1_ext(wf_components, slab, score - e1, k);
+                let (_, del_open) = bt_open1_pair(wf_components, score - o1_plus_e1, k);
+                let del_ext = bt_affine_del1_ext(wf_components, score - e1, k);
 
                 let max_all = del_open.max(del_ext);
                 if max_all < 0 {
@@ -862,8 +854,8 @@ pub fn backtrace_affine2p(
             }
             3 => {
                 // I2-state: gap open (M→I2) or gap extend (I2→I2)
-                let (ins_open, _) = bt_open2_pair(wf_components, slab, score - o2_plus_e2, k);
-                let ins_ext = bt_affine_ins2_ext(wf_components, slab, score - e2, k);
+                let (ins_open, _) = bt_open2_pair(wf_components, score - o2_plus_e2, k);
+                let ins_ext = bt_affine_ins2_ext(wf_components, score - e2, k);
 
                 let max_all = ins_open.max(ins_ext);
                 if max_all < 0 {
@@ -890,8 +882,8 @@ pub fn backtrace_affine2p(
             }
             4 => {
                 // D2-state: gap open (M→D2) or gap extend (D2→D2)
-                let (_, del_open) = bt_open2_pair(wf_components, slab, score - o2_plus_e2, k);
-                let del_ext = bt_affine_del2_ext(wf_components, slab, score - e2, k);
+                let (_, del_open) = bt_open2_pair(wf_components, score - o2_plus_e2, k);
+                let del_ext = bt_affine_del2_ext(wf_components, score - e2, k);
 
                 let max_all = del_open.max(del_ext);
                 if max_all < 0 {
@@ -950,11 +942,11 @@ pub fn backtrace_affine2p(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::aligner::{AlignStatus, AlignmentScope, WavefrontAligner};
+    use crate::aligner::{AlignStatus, AlignmentScope, EditAligner};
 
     #[test]
     fn test_backtrace_identical() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         aligner.alignment_scope = AlignmentScope::ComputeAlignment;
         let score = aligner.align_end2end(b"ACGT", b"ACGT");
         assert_eq!(score, 0);
@@ -965,7 +957,7 @@ mod tests {
 
     #[test]
     fn test_backtrace_one_mismatch() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         aligner.alignment_scope = AlignmentScope::ComputeAlignment;
         let score = aligner.align_end2end(b"ACGT", b"ACTT");
         assert_eq!(score, 1);
@@ -975,7 +967,7 @@ mod tests {
 
     #[test]
     fn test_backtrace_one_insertion() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         aligner.alignment_scope = AlignmentScope::ComputeAlignment;
         let score = aligner.align_end2end(b"ACT", b"ACGT");
         assert_eq!(score, 1);
@@ -986,7 +978,7 @@ mod tests {
 
     #[test]
     fn test_backtrace_one_deletion() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         aligner.alignment_scope = AlignmentScope::ComputeAlignment;
         let score = aligner.align_end2end(b"ACGT", b"ACT");
         assert_eq!(score, 1);
@@ -997,7 +989,7 @@ mod tests {
 
     #[test]
     fn test_backtrace_multiple_edits() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         aligner.alignment_scope = AlignmentScope::ComputeAlignment;
         let score = aligner.align_end2end(b"kitten", b"sitting");
         assert_eq!(score, 3);
@@ -1008,7 +1000,7 @@ mod tests {
 
     #[test]
     fn test_backtrace_empty_vs_nonempty() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         aligner.alignment_scope = AlignmentScope::ComputeAlignment;
         let score = aligner.align_end2end(b"", b"ACGT");
         assert_eq!(score, 4);
@@ -1017,7 +1009,7 @@ mod tests {
 
     #[test]
     fn test_backtrace_nonempty_vs_empty() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         aligner.alignment_scope = AlignmentScope::ComputeAlignment;
         let score = aligner.align_end2end(b"ACGT", b"");
         assert_eq!(score, 4);
@@ -1026,7 +1018,7 @@ mod tests {
 
     #[test]
     fn test_backtrace_indel_distance() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_indel());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_indel());
         aligner.alignment_scope = AlignmentScope::ComputeAlignment;
         let score = aligner.align_end2end(b"ACGT", b"ACTT");
         assert_eq!(score, 2);
@@ -1043,7 +1035,7 @@ mod tests {
 
     #[test]
     fn test_backtrace_completely_different() {
-        let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+        let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
         aligner.alignment_scope = AlignmentScope::ComputeAlignment;
         let score = aligner.align_end2end(b"AAAA", b"TTTT");
         assert_eq!(score, 4);

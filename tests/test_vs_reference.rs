@@ -1,7 +1,7 @@
 //! Integration tests: validate Rust output against C reference outputs.
 
 use std::fs;
-use wfa2lib_rs::aligner::{AlignmentScope, WavefrontAligner};
+use wfa2lib_rs::aligner::{AffineAligner, Affine2pAligner, AlignmentScope, EditAligner};
 use wfa2lib_rs::heuristic::HeuristicStrategy;
 use wfa2lib_rs::penalties::{Affine2pPenalties, AffinePenalties, WavefrontPenalties};
 use wfa2lib_rs::sequences::encode_packed2bits;
@@ -73,7 +73,7 @@ fn test_edit_distance_scores() {
     let expected_scores = parse_scores(ref_path);
     assert_eq!(pairs.len(), expected_scores.len());
 
-    let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+    let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
     let mut failures = Vec::new();
 
     for (i, ((pattern, text), expected)) in pairs.iter().zip(expected_scores.iter()).enumerate() {
@@ -109,7 +109,7 @@ fn test_indel_distance_scores() {
     let expected_scores = parse_scores(ref_path);
     assert_eq!(pairs.len(), expected_scores.len());
 
-    let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_indel());
+    let mut aligner = EditAligner::new(WavefrontPenalties::new_indel());
     let mut failures = Vec::new();
 
     for (i, ((pattern, text), expected)) in pairs.iter().zip(expected_scores.iter()).enumerate() {
@@ -145,7 +145,7 @@ fn test_edit_distance_cigars() {
     let expected = parse_alignments(ref_path);
     assert_eq!(pairs.len(), expected.len());
 
-    let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+    let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
     aligner.alignment_scope = AlignmentScope::ComputeAlignment;
     let mut failures = Vec::new();
 
@@ -198,7 +198,7 @@ fn test_indel_distance_cigars() {
     let expected = parse_alignments(ref_path);
     assert_eq!(pairs.len(), expected.len());
 
-    let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_indel());
+    let mut aligner = EditAligner::new(WavefrontPenalties::new_indel());
     aligner.alignment_scope = AlignmentScope::ComputeAlignment;
     let mut failures = Vec::new();
 
@@ -252,7 +252,7 @@ fn test_affine_distance_scores() {
     assert_eq!(pairs.len(), expected_scores.len());
 
     // Default affine penalties: mismatch=4, gap_opening=6, gap_extension=2
-    let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_affine(AffinePenalties {
+    let mut aligner = AffineAligner::new(WavefrontPenalties::new_affine(AffinePenalties {
         match_: 0,
         mismatch: 4,
         gap_opening: 6,
@@ -296,7 +296,7 @@ fn test_affine_distance_cigars() {
     assert_eq!(pairs.len(), expected.len());
 
     // Default affine penalties: mismatch=4, gap_opening=6, gap_extension=2
-    let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_affine(AffinePenalties {
+    let mut aligner = AffineAligner::new(WavefrontPenalties::new_affine(AffinePenalties {
         match_: 0,
         mismatch: 4,
         gap_opening: 6,
@@ -357,7 +357,7 @@ fn test_affine2p_distance_scores() {
     assert_eq!(pairs.len(), expected_scores.len());
 
     // Default affine2p penalties: M=0, X=4, O1=6, E1=2, O2=24, E2=1
-    let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_affine2p(Affine2pPenalties {
+    let mut aligner = Affine2pAligner::new(WavefrontPenalties::new_affine2p(Affine2pPenalties {
         match_: 0,
         mismatch: 4,
         gap_opening1: 6,
@@ -403,7 +403,7 @@ fn test_affine2p_distance_cigars() {
     assert_eq!(pairs.len(), expected.len());
 
     // Default affine2p penalties: M=0, X=4, O1=6, E1=2, O2=24, E2=1
-    let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_affine2p(Affine2pPenalties {
+    let mut aligner = Affine2pAligner::new(WavefrontPenalties::new_affine2p(Affine2pPenalties {
         match_: 0,
         mismatch: 4,
         gap_opening1: 6,
@@ -468,7 +468,7 @@ fn test_affine_wfadaptive_scores_pt0() {
     assert_eq!(pairs.len(), expected_scores.len());
 
     // Affine penalties: M=0, X=4, O=6, E=2 with WfAdaptive(10, 50, 1)
-    let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_affine(AffinePenalties {
+    let mut aligner = AffineAligner::new(WavefrontPenalties::new_affine(AffinePenalties {
         match_: 0,
         mismatch: 4,
         gap_opening: 6,
@@ -515,7 +515,7 @@ fn test_affine_wfadaptive_cigars_pt0() {
     let expected = parse_alignments(ref_path);
     assert_eq!(pairs.len(), expected.len());
 
-    let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_affine(AffinePenalties {
+    let mut aligner = AffineAligner::new(WavefrontPenalties::new_affine(AffinePenalties {
         match_: 0,
         mismatch: 4,
         gap_opening: 6,
@@ -579,7 +579,7 @@ fn test_affine_wfadaptive_scores_pt1() {
     assert_eq!(pairs.len(), expected_scores.len());
 
     // Affine penalties: M=0, X=4, O=6, E=2 with WfAdaptive(10, 50, 10)
-    let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_affine(AffinePenalties {
+    let mut aligner = AffineAligner::new(WavefrontPenalties::new_affine(AffinePenalties {
         match_: 0,
         mismatch: 4,
         gap_opening: 6,
@@ -626,7 +626,7 @@ fn test_affine_wfadaptive_cigars_pt1() {
     let expected = parse_alignments(ref_path);
     assert_eq!(pairs.len(), expected.len());
 
-    let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_affine(AffinePenalties {
+    let mut aligner = AffineAligner::new(WavefrontPenalties::new_affine(AffinePenalties {
         match_: 0,
         mismatch: 4,
         gap_opening: 6,
@@ -691,7 +691,7 @@ fn test_biwfa_edit_scores() {
     let expected_scores = parse_scores(ref_path);
     assert_eq!(pairs.len(), expected_scores.len());
 
-    let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_edit());
+    let mut aligner = EditAligner::new(WavefrontPenalties::new_edit());
     let mut failures = Vec::new();
 
     for (i, ((pattern, text), expected)) in pairs.iter().zip(expected_scores.iter()).enumerate() {
@@ -731,7 +731,7 @@ fn test_biwfa_affine_scores() {
     let expected_scores = parse_scores(ref_path);
     assert_eq!(pairs.len(), expected_scores.len());
 
-    let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_affine(AffinePenalties {
+    let mut aligner = AffineAligner::new(WavefrontPenalties::new_affine(AffinePenalties {
         match_: 0,
         mismatch: 4,
         gap_opening: 6,
@@ -782,7 +782,7 @@ fn test_biwfa_affine2p_scores() {
     let expected_scores = parse_scores(ref_path);
     assert_eq!(pairs.len(), expected_scores.len());
 
-    let mut aligner = WavefrontAligner::new(WavefrontPenalties::new_affine2p(Affine2pPenalties {
+    let mut aligner = Affine2pAligner::new(WavefrontPenalties::new_affine2p(Affine2pPenalties {
         match_: 0,
         mismatch: 4,
         gap_opening1: 6,
@@ -841,7 +841,7 @@ fn test_lambda_edit_scores() {
         let match_funct =
             move |ppos: i32, tpos: i32| -> bool { p[ppos as usize] == t[tpos as usize] };
 
-        let mut aligner = WavefrontAligner::new(penalties.clone());
+        let mut aligner = EditAligner::new(penalties.clone());
         let score = aligner.align_lambda(Box::new(match_funct), plen, tlen);
 
         if score != *expected_score {
@@ -884,7 +884,7 @@ fn test_lambda_affine_scores() {
         let match_funct =
             move |ppos: i32, tpos: i32| -> bool { p[ppos as usize] == t[tpos as usize] };
 
-        let mut aligner = WavefrontAligner::new(penalties.clone());
+        let mut aligner = AffineAligner::new(penalties.clone());
         let score = aligner.align_lambda(Box::new(match_funct), plen, tlen);
 
         let expected_positive = -expected_score;
@@ -927,7 +927,7 @@ fn test_packed2bits_affine_scores() {
         let ppacked = encode_packed2bits(pattern);
         let tpacked = encode_packed2bits(text);
 
-        let mut aligner = WavefrontAligner::new(penalties.clone());
+        let mut aligner = AffineAligner::new(penalties.clone());
         let score = aligner.align_packed2bits(&ppacked, pattern.len(), &tpacked, text.len());
 
         let expected_positive = -expected_score;
