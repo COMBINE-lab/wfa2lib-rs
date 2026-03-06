@@ -51,6 +51,9 @@ pub struct WavefrontComponents<const N: usize> {
     pub historic_max_hi: i32,
     /// Minimum lo-limit seen during current alignment.
     pub historic_min_lo: i32,
+    /// Number of flat slots used by the previous alignment (= last_score + 1).
+    /// Used in non-modular mode to clear only the needed range on the next alignment.
+    pub prev_score_count: usize,
 
     // Interleaved wavefront pointer array.
     // flat[score] = [m_ptr, i1_ptr, d1_ptr, i2_ptr, d2_ptr] (first N are valid).
@@ -110,6 +113,7 @@ impl<const N: usize> WavefrontComponents<N> {
             max_score_scope,
             historic_max_hi: 0,
             historic_min_lo: 0,
+            prev_score_count: 0,
             flat: vec![[WF_PTR_NONE; N]; num_wavefronts],
             wavefront_null,
             wavefront_victim,
@@ -118,8 +122,31 @@ impl<const N: usize> WavefrontComponents<N> {
     }
 
     /// Clear all wavefront slots and reset historic limits.
+    ///
+    /// In non-modular (CIGAR) mode: skip filling the flat array.
+    /// The forward pass always overwrites every entry [0..final_score] before
+    /// the backtrace reads them, so nulling stale entries is unnecessary.
+    /// This matches C's wavefront_components_clear() which only clears in
+    /// modular mode (where the circular buffer needs to be reset).
+    ///
+    /// In modular (score-only) mode: only clear the circular buffer entries
+    /// (max_score_scope entries), not the full oversized flat array.
     pub fn clear(&mut self) {
-        self.flat.fill([WF_PTR_NONE; N]);
+        if self.memory_modular {
+            // Modular: clear only the slots used by the circular buffer.
+            let n = self.max_score_scope.min(self.flat.len());
+            self.flat[..n].fill([WF_PTR_NONE; N]);
+        } else {
+            // Non-modular: clear only the slots used by the previous alignment.
+            // Invariant: flat[prev_score_count..] is already null, so clearing
+            // [0..prev_score_count] leaves the entire flat array null.
+            // This avoids the 160KB fill for the full num_wavefronts array.
+            let n = self.prev_score_count.min(self.flat.len());
+            if n > 0 {
+                self.flat[..n].fill([WF_PTR_NONE; N]);
+            }
+            self.prev_score_count = 0;
+        }
         self.historic_max_hi = 0;
         self.historic_min_lo = 0;
         if let Some(ref mut bt_buffer) = self.bt_buffer {
@@ -151,6 +178,7 @@ impl<const N: usize> WavefrontComponents<N> {
 
         if num_wavefronts > self.num_wavefronts {
             self.num_wavefronts = num_wavefronts;
+            self.prev_score_count = 0; // new array is already null-filled
             self.flat = vec![[WF_PTR_NONE; N]; num_wavefronts];
             if let Some(ref mut bt_buffer) = self.bt_buffer {
                 bt_buffer.clear();

@@ -211,6 +211,9 @@ impl<const N: usize> WavefrontAligner<N> {
             }
         }
 
+        // Record how many flat slots were used (for efficient clear on next alignment).
+        self.wf_components.prev_score_count = (score + 1) as usize;
+
         // Finalize
         if self.status == AlignStatus::EndReached {
             // Backtrace to produce CIGAR if requested
@@ -321,6 +324,9 @@ impl<const N: usize> WavefrontAligner<N> {
                 break;
             }
         }
+
+        // Record how many flat slots were used (for efficient clear on next alignment).
+        self.wf_components.prev_score_count = (score + 1) as usize;
 
         // Finalize
         if self.status == AlignStatus::EndReached || self.status == AlignStatus::EndUnreachable {
@@ -1579,6 +1585,9 @@ impl<const N: usize> WavefrontAligner<N> {
                 break;
             }
         }
+
+        // Record how many flat slots were used (for efficient clear on next call).
+        base.wf_components.prev_score_count = (score + 1) as usize;
 
         // Backtrace with component-aware start/end
         if base.status == AlignStatus::EndReached {
