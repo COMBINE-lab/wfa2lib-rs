@@ -1001,6 +1001,11 @@ impl<const N: usize> WavefrontAligner<N> {
     }
 
     /// Compute the next wavefront for gap-affine 2-piece distance.
+    ///
+    /// Matches C's conditional allocation and dispatcher: when all O2/E2
+    /// inputs are null, delegates to the affine (3-component) kernel and
+    /// skips I2/D2 allocation entirely. For I1/D1, allocation is also
+    /// skipped when both inputs are null (using victim wavefront for output).
     fn compute_affine2p_step(&mut self, score: i32) {
         let score_curr = score as usize;
         let plen = self.sequences.pattern_length;
@@ -1021,6 +1026,12 @@ impl<const N: usize> WavefrontAligner<N> {
         let ptr_i2_ext  = if score - e2 >= 0 { self.wf_components.get_i2_ptr((score - e2) as usize) } else { WF_PTR_NONE };
         let ptr_d1_ext  = if score - e1 >= 0 { self.wf_components.get_d1_ptr((score - e1) as usize) } else { WF_PTR_NONE };
         let ptr_d2_ext  = if score - e2 >= 0 { self.wf_components.get_d2_ptr((score - e2) as usize) } else { WF_PTR_NONE };
+
+        // When all O2/E2 inputs are null, dispatch to the affine kernel (3 components).
+        // This avoids loading/storing I2/D2 entirely, reducing work by ~40%.
+        let i2_active = !ptr_m_open2.is_null() || !ptr_i2_ext.is_null();
+        let d2_active = !ptr_m_open2.is_null() || !ptr_d2_ext.is_null();
+        let use_affine_kernel = !i2_active && !d2_active;
 
         // Compute effective lo/hi from pointers (no slab re-lookup)
         let mut lo = i32::MAX;
@@ -1069,95 +1080,137 @@ impl<const N: usize> WavefrontAligner<N> {
             if !ptr_d2_ext.is_null()  { (*ptr_d2_ext).init_ends_higher(hi + 1);  (*ptr_d2_ext).init_ends_lower(lo);      }
         }
 
-        // Allocate or reuse 5 output wavefronts.
-        // Modular path: reinit in-place via raw pointer (skip ptr→idx→ptr
-        // round-trip through slab). Null pointers go to allocate_ptr.
-        let (m_curr_ptr, i1_curr_ptr, i2_curr_ptr, d1_curr_ptr, d2_curr_ptr) =
-            if self.wf_components.memory_modular {
-                macro_rules! reuse_or_alloc {
-                    ($comp:ident, $score:expr) => {{
-                        let old = self.wf_components.$comp($score);
-                        if !old.is_null() {
-                            unsafe { (*old).init(hist_lo, hist_hi); (*old).status = WavefrontStatus::Busy; }
-                            old
-                        } else {
-                            self.wavefront_slab.allocate_ptr(hist_lo, hist_hi)
-                        }
-                    }}
+        // Allocate or reuse output wavefronts.
+        // M, I1, D1 are always allocated. I2/D2 are skipped when dispatching
+        // to the affine kernel (use_affine_kernel), storing NULL in components.
+        macro_rules! reuse_or_alloc {
+            ($comp:ident, $score:expr) => {{
+                let old = self.wf_components.$comp($score);
+                if !old.is_null() {
+                    unsafe { (*old).init(hist_lo, hist_hi); (*old).status = WavefrontStatus::Busy; }
+                    old
+                } else {
+                    self.wavefront_slab.allocate_ptr(hist_lo, hist_hi)
                 }
+            }}
+        }
+
+        let victim_ptr = &raw mut self.wf_components.wavefront_victim;
+
+        let (m_curr_ptr, i1_curr_ptr, d1_curr_ptr) =
+            if self.wf_components.memory_modular {
                 (
                     reuse_or_alloc!(get_m_ptr,  score_curr),
                     reuse_or_alloc!(get_i1_ptr, score_curr),
-                    reuse_or_alloc!(get_i2_ptr, score_curr),
                     reuse_or_alloc!(get_d1_ptr, score_curr),
-                    reuse_or_alloc!(get_d2_ptr, score_curr),
                 )
             } else {
                 (
                     self.wavefront_slab.allocate_ptr(hist_lo, hist_hi),
                     self.wavefront_slab.allocate_ptr(hist_lo, hist_hi),
                     self.wavefront_slab.allocate_ptr(hist_lo, hist_hi),
-                    self.wavefront_slab.allocate_ptr(hist_lo, hist_hi),
-                    self.wavefront_slab.allocate_ptr(hist_lo, hist_hi),
                 )
             };
 
-        // Compute kernel using raw pointers for multi-borrow
-        // Input ptrs come directly from flat[] (no extra slab lookups); outputs are fresh.
+        let (i2_curr_ptr, i2_stored) = if !use_affine_kernel {
+            let p = if self.wf_components.memory_modular {
+                reuse_or_alloc!(get_i2_ptr, score_curr)
+            } else {
+                self.wavefront_slab.allocate_ptr(hist_lo, hist_hi)
+            };
+            (p, true)
+        } else {
+            (victim_ptr, false)
+        };
+
+        let (d2_curr_ptr, d2_stored) = if !use_affine_kernel {
+            let p = if self.wf_components.memory_modular {
+                reuse_or_alloc!(get_d2_ptr, score_curr)
+            } else {
+                self.wavefront_slab.allocate_ptr(hist_lo, hist_hi)
+            };
+            (p, true)
+        } else {
+            (victim_ptr, false)
+        };
+
+        // Compute kernel using raw pointers for multi-borrow.
+        // When all O2/E2 inputs are null, dispatch to the affine (3-component) kernel
+        // which avoids loading/storing I2/D2 entirely (matching C's dispatcher).
         unsafe {
             let null_wf = &self.wf_components.wavefront_null as *const _;
             let wf_m_misms = if !ptr_m_misms.is_null() { ptr_m_misms as *const _ } else { null_wf };
             let wf_m_open1 = if !ptr_m_open1.is_null() { ptr_m_open1 as *const _ } else { null_wf };
-            let wf_m_open2 = if !ptr_m_open2.is_null() { ptr_m_open2 as *const _ } else { null_wf };
-            let wf_i1_ext  = if !ptr_i1_ext.is_null()  { ptr_i1_ext  as *const _ } else { null_wf };
-            let wf_i2_ext  = if !ptr_i2_ext.is_null()  { ptr_i2_ext  as *const _ } else { null_wf };
-            let wf_d1_ext  = if !ptr_d1_ext.is_null()  { ptr_d1_ext  as *const _ } else { null_wf };
-            let wf_d2_ext  = if !ptr_d2_ext.is_null()  { ptr_d2_ext  as *const _ } else { null_wf };
 
-            // set_limits on output wavefronts via raw ptrs (avoids 5 more slab lookups)
+            // set_limits on output wavefronts
             (*m_curr_ptr).set_limits(lo, hi);
             (*i1_curr_ptr).set_limits(lo, hi);
-            (*i2_curr_ptr).set_limits(lo, hi);
             (*d1_curr_ptr).set_limits(lo, hi);
-            (*d2_curr_ptr).set_limits(lo, hi);
 
-            affine2p::compute_affine2p_idm(
-                plen,
-                tlen,
-                &*wf_m_misms,
-                &*wf_m_open1,
-                &*wf_m_open2,
-                &*wf_i1_ext,
-                &*wf_i2_ext,
-                &*wf_d1_ext,
-                &*wf_d2_ext,
-                &mut *m_curr_ptr,
-                &mut *i1_curr_ptr,
-                &mut *i2_curr_ptr,
-                &mut *d1_curr_ptr,
-                &mut *d2_curr_ptr,
-                lo,
-                hi,
-            );
+            if use_affine_kernel {
+                // Delegate to affine kernel (3 components) — no I2/D2 loads or stores
+                let wf_i1_ext_ref = if !ptr_i1_ext.is_null() { ptr_i1_ext as *const _ } else { null_wf };
+                let wf_d1_ext_ref = if !ptr_d1_ext.is_null() { ptr_d1_ext as *const _ } else { null_wf };
+
+                affine::compute_affine_idm(
+                    plen,
+                    tlen,
+                    &*wf_m_misms,
+                    &*wf_m_open1,
+                    &*wf_i1_ext_ref,
+                    &*wf_d1_ext_ref,
+                    &mut *m_curr_ptr,
+                    &mut *i1_curr_ptr,
+                    &mut *d1_curr_ptr,
+                    lo,
+                    hi,
+                );
+            } else {
+                // Full affine2p kernel (5 components)
+                let wf_m_open2 = if !ptr_m_open2.is_null() { ptr_m_open2 as *const _ } else { null_wf };
+                let wf_i1_ext_ref = if !ptr_i1_ext.is_null()  { ptr_i1_ext  as *const _ } else { null_wf };
+                let wf_i2_ext_ref = if !ptr_i2_ext.is_null()  { ptr_i2_ext  as *const _ } else { null_wf };
+                let wf_d1_ext_ref = if !ptr_d1_ext.is_null()  { ptr_d1_ext  as *const _ } else { null_wf };
+                let wf_d2_ext_ref = if !ptr_d2_ext.is_null()  { ptr_d2_ext  as *const _ } else { null_wf };
+
+                if i2_stored { (*i2_curr_ptr).set_limits(lo, hi); }
+                if d2_stored { (*d2_curr_ptr).set_limits(lo, hi); }
+
+                affine2p::compute_affine2p_idm(
+                    plen,
+                    tlen,
+                    &*wf_m_misms,
+                    &*wf_m_open1,
+                    &*wf_m_open2,
+                    &*wf_i1_ext_ref,
+                    &*wf_i2_ext_ref,
+                    &*wf_d1_ext_ref,
+                    &*wf_d2_ext_ref,
+                    &mut *m_curr_ptr,
+                    &mut *i1_curr_ptr,
+                    &mut *i2_curr_ptr,
+                    &mut *d1_curr_ptr,
+                    &mut *d2_curr_ptr,
+                    lo,
+                    hi,
+                );
+            }
         }
 
-        // Store in components
+        // Store in components — NULL for skipped I2/D2 wavefronts
         self.wf_components.set_m_ptr(score_curr, m_curr_ptr);
         self.wf_components.set_i1_ptr(score_curr, i1_curr_ptr);
-        self.wf_components.set_i2_ptr(score_curr, i2_curr_ptr);
+        self.wf_components.set_i2_ptr(score_curr, if i2_stored { i2_curr_ptr } else { WF_PTR_NONE });
         self.wf_components.set_d1_ptr(score_curr, d1_curr_ptr);
-        self.wf_components.set_d2_ptr(score_curr, d2_curr_ptr);
+        self.wf_components.set_d2_ptr(score_curr, if d2_stored { d2_curr_ptr } else { WF_PTR_NONE });
 
-        // Trim ends on all output wavefronts — matches C's process_ends.
-        // Trimming I/D wavefronts tightens their lo/hi, which feeds back into
-        // the next step's lo/hi calculation, reducing work in the kernel, init_ends,
-        // and allocation. Without this, the diagonal range grows monotonically.
+        // Trim ends on allocated output wavefronts — matches C's process_ends.
         unsafe {
             compute::trim_ends(plen, tlen, &mut *m_curr_ptr);
             compute::trim_ends(plen, tlen, &mut *i1_curr_ptr);
-            compute::trim_ends(plen, tlen, &mut *i2_curr_ptr);
             compute::trim_ends(plen, tlen, &mut *d1_curr_ptr);
-            compute::trim_ends(plen, tlen, &mut *d2_curr_ptr);
+            if i2_stored { compute::trim_ends(plen, tlen, &mut *i2_curr_ptr); }
+            if d2_stored { compute::trim_ends(plen, tlen, &mut *d2_curr_ptr); }
             if (*m_curr_ptr).null {
                 self.num_null_steps = i32::MAX;
             }
