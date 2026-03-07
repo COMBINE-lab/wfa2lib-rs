@@ -127,7 +127,7 @@ pub fn compute_affine2p_idm(
         #[cfg(target_arch = "x86_64")]
         {
             use std::arch::x86_64::*;
-            if count >= 8 && is_x86_feature_detected!("avx2") {
+            if count >= 8 && (cfg!(target_feature = "avx2") || is_x86_feature_detected!("avx2")) {
                 unsafe {
                     let v_one = _mm256_set1_epi32(1);
                     let v_eight = _mm256_set1_epi32(8);
@@ -141,7 +141,19 @@ pub fn compute_affine2p_idm(
                     );
                     let avx_end = lo + (count & !7);
 
+                    // Prefetch distance: 16 diagonals ahead (2 AVX iterations = 64 bytes)
+                    const PF_DIST: isize = 16;
+
                     while k < avx_end {
+                        // Prefetch next chunk of all 7 input arrays
+                        _mm_prefetch(m_open1.offset(k as isize + PF_DIST) as *const i8, _MM_HINT_T0);
+                        _mm_prefetch(m_open2.offset(k as isize + PF_DIST) as *const i8, _MM_HINT_T0);
+                        _mm_prefetch(i1_ext.offset(k as isize + PF_DIST) as *const i8, _MM_HINT_T0);
+                        _mm_prefetch(i2_ext.offset(k as isize + PF_DIST) as *const i8, _MM_HINT_T0);
+                        _mm_prefetch(d1_ext.offset(k as isize + PF_DIST) as *const i8, _MM_HINT_T0);
+                        _mm_prefetch(d2_ext.offset(k as isize + PF_DIST) as *const i8, _MM_HINT_T0);
+                        _mm_prefetch(m_misms.offset(k as isize + PF_DIST) as *const i8, _MM_HINT_T0);
+
                         // I1, I2 (shifted by -1)
                         let v_i1 = _mm256_add_epi32(_mm256_max_epi32(
                             _mm256_loadu_si256(m_open1.offset(k as isize - 1) as *const __m256i),

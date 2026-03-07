@@ -159,6 +159,7 @@ impl WavefrontSlab {
     }
 
     /// Free (return) a wavefront to the slab.
+    #[inline(always)]
     pub fn free(&mut self, idx: WavefrontIdx) {
         let wf_length = self.wavefronts[idx].wf_elements_allocated;
 
@@ -314,6 +315,7 @@ impl WavefrontSlab {
     ///
     /// # Safety
     /// If non-null, `ptr` must be a valid pointer into `self.wavefronts`.
+    #[inline(always)]
     pub fn free_ptr(&mut self, ptr: *mut Wavefront) {
         if ptr.is_null() {
             return;

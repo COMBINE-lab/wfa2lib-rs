@@ -11,11 +11,14 @@ use crate::wavefront::Wavefront;
 /// Trim wavefront ends: remove diagonals where the offset is out of bounds.
 /// Sets `wf.null = true` if all diagonals are trimmed.
 pub fn trim_ends(pattern_length: i32, text_length: i32, wf: &mut Wavefront) {
+    // Use pre-centered pointer for direct k-indexed access
+    let centered = unsafe { wf.offsets_centered_mut_ptr() };
+
     // Trim from hi
     let lo = wf.lo;
     let mut k = wf.hi;
     while k >= lo {
-        let offset = wf.get_offset(k);
+        let offset = unsafe { *centered.offset(k as isize) };
         let h = wavefront_h(k, offset) as u32;
         let v = wavefront_v(k, offset) as u32;
         if h <= text_length as u32 && v <= pattern_length as u32 {
@@ -30,7 +33,7 @@ pub fn trim_ends(pattern_length: i32, text_length: i32, wf: &mut Wavefront) {
     let hi = wf.hi;
     k = wf.lo;
     while k <= hi {
-        let offset = wf.get_offset(k);
+        let offset = unsafe { *centered.offset(k as isize) };
         let h = wavefront_h(k, offset) as u32;
         let v = wavefront_v(k, offset) as u32;
         if h <= text_length as u32 && v <= pattern_length as u32 {

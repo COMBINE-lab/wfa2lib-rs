@@ -9,8 +9,9 @@
 //! - N=3: GapAffine (M + I1 + D1)
 //! - N=5: GapAffine2p (M + I1 + D1 + I2 + D2)
 //!
-//! `flat[score]` = `[m_ptr, i1_ptr, d1_ptr, i2_ptr, d2_ptr]` — all N pointers for a given
-//! score are contiguous in memory, fitting in a single cache line for N=5 (40 bytes).
+//! Each component has its own contiguous Vec (stride = 8 bytes per slot),
+//! matching C's separate `mwavefronts[]`, `i1wavefronts[]`, etc. arrays
+//! for optimal cache behavior when accessing the same component across scores.
 
 use crate::bt_buffer::BacktraceBuffer;
 use crate::offset::wavefront_length;
@@ -35,6 +36,11 @@ pub const COMP_D2: usize = 4;
 ///
 /// The const generic `N` is the number of component slots per score:
 /// 1 for edit/indel/linear, 3 for affine, 5 for affine2p.
+///
+/// Each component gets its own contiguous `Vec<*mut Wavefront>` so that
+/// same-component lookups across different scores have stride 8B (one pointer)
+/// instead of N*8B with the interleaved layout. This reduces cache pressure
+/// when fetching multiple M-wavefronts at different score offsets.
 pub struct WavefrontComponents<const N: usize> {
     // Configuration
     /// Whether to use modular (circular) wavefront storage.
@@ -55,10 +61,9 @@ pub struct WavefrontComponents<const N: usize> {
     /// Used in non-modular mode to clear only the needed range on the next alignment.
     pub prev_score_count: usize,
 
-    // Interleaved wavefront pointer array.
-    // flat[score] = [m_ptr, i1_ptr, d1_ptr, i2_ptr, d2_ptr] (first N are valid).
-    // All N pointers for a given score are contiguous — fits in one cache line for N=5.
-    pub flat: Vec<[*mut Wavefront; N]>,
+    // Separate component arrays — each is a contiguous Vec with 8B stride.
+    // arrays[COMP_M][slot], arrays[COMP_I1][slot], etc.
+    arrays: [Vec<*mut Wavefront>; N],
 
     // Special wavefronts (owned directly, not in slab)
     /// Null wavefront: reads return OFFSET_NULL.
@@ -114,7 +119,7 @@ impl<const N: usize> WavefrontComponents<N> {
             historic_max_hi: 0,
             historic_min_lo: 0,
             prev_score_count: 0,
-            flat: vec![[WF_PTR_NONE; N]; num_wavefronts],
+            arrays: std::array::from_fn(|_| vec![WF_PTR_NONE; num_wavefronts]),
             wavefront_null,
             wavefront_victim,
             bt_buffer,
@@ -134,16 +139,17 @@ impl<const N: usize> WavefrontComponents<N> {
     pub fn clear(&mut self) {
         if self.memory_modular {
             // Modular: clear only the slots used by the circular buffer.
-            let n = self.max_score_scope.min(self.flat.len());
-            self.flat[..n].fill([WF_PTR_NONE; N]);
+            let n = self.max_score_scope.min(self.num_wavefronts);
+            for arr in &mut self.arrays {
+                arr[..n].fill(WF_PTR_NONE);
+            }
         } else {
             // Non-modular: clear only the slots used by the previous alignment.
-            // Invariant: flat[prev_score_count..] is already null, so clearing
-            // [0..prev_score_count] leaves the entire flat array null.
-            // This avoids the 160KB fill for the full num_wavefronts array.
-            let n = self.prev_score_count.min(self.flat.len());
+            let n = self.prev_score_count.min(self.num_wavefronts);
             if n > 0 {
-                self.flat[..n].fill([WF_PTR_NONE; N]);
+                for arr in &mut self.arrays {
+                    arr[..n].fill(WF_PTR_NONE);
+                }
             }
             self.prev_score_count = 0;
         }
@@ -178,8 +184,8 @@ impl<const N: usize> WavefrontComponents<N> {
 
         if num_wavefronts > self.num_wavefronts {
             self.num_wavefronts = num_wavefronts;
-            self.prev_score_count = 0; // new array is already null-filled
-            self.flat = vec![[WF_PTR_NONE; N]; num_wavefronts];
+            self.prev_score_count = 0; // new arrays are already null-filled
+            self.arrays = std::array::from_fn(|_| vec![WF_PTR_NONE; num_wavefronts]);
             if let Some(ref mut bt_buffer) = self.bt_buffer {
                 bt_buffer.clear();
             }
@@ -212,80 +218,141 @@ impl<const N: usize> WavefrontComponents<N> {
     #[inline(always)]
     fn slot(&self, score: usize) -> usize {
         if self.memory_modular {
-            score % self.max_score_scope
+            // Use 32-bit division: ~20 cycles on Broadwell vs ~35-90 for 64-bit.
+            // Both score and max_score_scope always fit in u32.
+            (score as u32 % self.max_score_scope as u32) as usize
         } else {
             score
         }
+    }
+
+    /// Compute the flat-array slot for a given score (public, for callers
+    /// that want to compute the slot once and reuse it across multiple accesses).
+    #[inline(always)]
+    pub fn slot_of(&self, score: usize) -> usize {
+        self.slot(score)
     }
 
     /// Get the wavefront pointer for M-wavefronts at a given score.
     #[inline(always)]
     pub fn get_m_ptr(&self, score: usize) -> *mut Wavefront {
         let s = self.slot(score);
-        unsafe { self.flat.get_unchecked(s)[COMP_M] }
+        unsafe { *self.arrays.get_unchecked(COMP_M).get_unchecked(s) }
     }
 
     /// Set the wavefront pointer for M-wavefronts at a given score.
     #[inline(always)]
     pub fn set_m_ptr(&mut self, score: usize, ptr: *mut Wavefront) {
         let s = self.slot(score);
-        unsafe { self.flat.get_unchecked_mut(s)[COMP_M] = ptr; }
+        unsafe { *self.arrays.get_unchecked_mut(COMP_M).get_unchecked_mut(s) = ptr; }
     }
 
     /// Get the wavefront pointer for I1-wavefronts at a given score.
     #[inline(always)]
     pub fn get_i1_ptr(&self, score: usize) -> *mut Wavefront {
         let s = self.slot(score);
-        unsafe { self.flat.get_unchecked(s)[COMP_I1] }
+        unsafe { *self.arrays.get_unchecked(COMP_I1).get_unchecked(s) }
     }
 
     /// Set the wavefront pointer for I1-wavefronts at a given score.
     #[inline(always)]
     pub fn set_i1_ptr(&mut self, score: usize, ptr: *mut Wavefront) {
         let s = self.slot(score);
-        unsafe { self.flat.get_unchecked_mut(s)[COMP_I1] = ptr; }
+        unsafe { *self.arrays.get_unchecked_mut(COMP_I1).get_unchecked_mut(s) = ptr; }
     }
 
     /// Get the wavefront pointer for D1-wavefronts at a given score.
     #[inline(always)]
     pub fn get_d1_ptr(&self, score: usize) -> *mut Wavefront {
         let s = self.slot(score);
-        unsafe { self.flat.get_unchecked(s)[COMP_D1] }
+        unsafe { *self.arrays.get_unchecked(COMP_D1).get_unchecked(s) }
     }
 
     /// Set the wavefront pointer for D1-wavefronts at a given score.
     #[inline(always)]
     pub fn set_d1_ptr(&mut self, score: usize, ptr: *mut Wavefront) {
         let s = self.slot(score);
-        unsafe { self.flat.get_unchecked_mut(s)[COMP_D1] = ptr; }
+        unsafe { *self.arrays.get_unchecked_mut(COMP_D1).get_unchecked_mut(s) = ptr; }
     }
 
     /// Get the wavefront pointer for I2-wavefronts at a given score.
     #[inline(always)]
     pub fn get_i2_ptr(&self, score: usize) -> *mut Wavefront {
         let s = self.slot(score);
-        unsafe { self.flat.get_unchecked(s)[COMP_I2] }
+        unsafe { *self.arrays.get_unchecked(COMP_I2).get_unchecked(s) }
     }
 
     /// Set the wavefront pointer for I2-wavefronts at a given score.
     #[inline(always)]
     pub fn set_i2_ptr(&mut self, score: usize, ptr: *mut Wavefront) {
         let s = self.slot(score);
-        unsafe { self.flat.get_unchecked_mut(s)[COMP_I2] = ptr; }
+        unsafe { *self.arrays.get_unchecked_mut(COMP_I2).get_unchecked_mut(s) = ptr; }
     }
 
     /// Get the wavefront pointer for D2-wavefronts at a given score.
     #[inline(always)]
     pub fn get_d2_ptr(&self, score: usize) -> *mut Wavefront {
         let s = self.slot(score);
-        unsafe { self.flat.get_unchecked(s)[COMP_D2] }
+        unsafe { *self.arrays.get_unchecked(COMP_D2).get_unchecked(s) }
     }
 
     /// Set the wavefront pointer for D2-wavefronts at a given score.
     #[inline(always)]
     pub fn set_d2_ptr(&mut self, score: usize, ptr: *mut Wavefront) {
         let s = self.slot(score);
-        unsafe { self.flat.get_unchecked_mut(s)[COMP_D2] = ptr; }
+        unsafe { *self.arrays.get_unchecked_mut(COMP_D2).get_unchecked_mut(s) = ptr; }
+    }
+
+    // --- Direct slot-based accessors (skip modular division) ---
+
+    #[inline(always)]
+    pub fn get_m_ptr_slot(&self, slot: usize) -> *mut Wavefront {
+        unsafe { *self.arrays.get_unchecked(COMP_M).get_unchecked(slot) }
+    }
+
+    #[inline(always)]
+    pub fn set_m_ptr_slot(&mut self, slot: usize, ptr: *mut Wavefront) {
+        unsafe { *self.arrays.get_unchecked_mut(COMP_M).get_unchecked_mut(slot) = ptr; }
+    }
+
+    #[inline(always)]
+    pub fn get_i1_ptr_slot(&self, slot: usize) -> *mut Wavefront {
+        unsafe { *self.arrays.get_unchecked(COMP_I1).get_unchecked(slot) }
+    }
+
+    #[inline(always)]
+    pub fn set_i1_ptr_slot(&mut self, slot: usize, ptr: *mut Wavefront) {
+        unsafe { *self.arrays.get_unchecked_mut(COMP_I1).get_unchecked_mut(slot) = ptr; }
+    }
+
+    #[inline(always)]
+    pub fn get_d1_ptr_slot(&self, slot: usize) -> *mut Wavefront {
+        unsafe { *self.arrays.get_unchecked(COMP_D1).get_unchecked(slot) }
+    }
+
+    #[inline(always)]
+    pub fn set_d1_ptr_slot(&mut self, slot: usize, ptr: *mut Wavefront) {
+        unsafe { *self.arrays.get_unchecked_mut(COMP_D1).get_unchecked_mut(slot) = ptr; }
+    }
+
+    #[inline(always)]
+    pub fn get_i2_ptr_slot(&self, slot: usize) -> *mut Wavefront {
+        unsafe { *self.arrays.get_unchecked(COMP_I2).get_unchecked(slot) }
+    }
+
+    #[inline(always)]
+    pub fn set_i2_ptr_slot(&mut self, slot: usize, ptr: *mut Wavefront) {
+        unsafe { *self.arrays.get_unchecked_mut(COMP_I2).get_unchecked_mut(slot) = ptr; }
+    }
+
+    #[inline(always)]
+    pub fn get_d2_ptr_slot(&self, slot: usize) -> *mut Wavefront {
+        unsafe { *self.arrays.get_unchecked(COMP_D2).get_unchecked(slot) }
+    }
+
+    #[inline(always)]
+    pub fn set_d2_ptr_slot(&mut self, slot: usize, ptr: *mut Wavefront) {
+        unsafe { *self.arrays.get_unchecked_mut(COMP_D2).get_unchecked_mut(slot) = ptr; }
     }
 
     // --- Internal dimension computation ---
@@ -366,8 +433,8 @@ mod tests {
         let penalties = WavefrontPenalties::new_edit();
         let comp = WavefrontComponents::<1>::new(100, 100, &penalties, false, false);
         assert_eq!(comp.max_score_scope, 2);
-        assert_eq!(comp.flat.len(), 101);
-        assert!(!comp.flat.is_empty());
+        assert_eq!(comp.num_wavefronts, 101);
+        assert_eq!(comp.arrays[0].len(), 101);
     }
 
     #[test]
@@ -381,7 +448,7 @@ mod tests {
         let comp = WavefrontComponents::<3>::new(100, 100, &penalties, false, false);
         // max_score_scope = max(6+2, 4) + 1 = 9
         assert_eq!(comp.max_score_scope, 9);
-        assert_eq!(comp.flat[0].len(), 3);
+        assert_eq!(comp.arrays.len(), 3);
     }
 
     #[test]
@@ -395,7 +462,7 @@ mod tests {
             gap_extension2: 1,
         });
         let comp = WavefrontComponents::<5>::new(100, 100, &penalties, false, false);
-        assert_eq!(comp.flat[0].len(), 5);
+        assert_eq!(comp.arrays.len(), 5);
     }
 
     #[test]
@@ -486,12 +553,8 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_line_layout() {
-        // For N=5, each flat[score] is 5 * 8 = 40 bytes — fits in one cache line.
-        assert_eq!(std::mem::size_of::<[*mut Wavefront; 5]>(), 40);
-        // For N=3: 24 bytes.
-        assert_eq!(std::mem::size_of::<[*mut Wavefront; 3]>(), 24);
-        // For N=1: 8 bytes.
-        assert_eq!(std::mem::size_of::<[*mut Wavefront; 1]>(), 8);
+    fn test_separate_array_stride() {
+        // Each component array has pointer-sized (8 byte) stride between consecutive slots.
+        assert_eq!(std::mem::size_of::<*mut Wavefront>(), 8);
     }
 }

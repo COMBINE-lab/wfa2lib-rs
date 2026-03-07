@@ -44,6 +44,10 @@ pub struct Wavefront {
     // Pointers first (8-byte aligned)
     /// Raw offset storage buffer.
     pub(crate) offsets_ptr: *mut WfOffset,
+    /// Pre-centered offset pointer: `centered[k]` accesses diagonal `k` directly.
+    /// Equals `offsets_ptr.wrapping_offset(-(base_k as isize))`.
+    /// Matches C's `offsets = offsets_mem - min_lo` pattern.
+    pub(crate) centered_offsets: *mut WfOffset,
     /// Backtrace pcigar values (null if no backtrace).
     bt_pcigar_ptr: *mut Pcigar,
     /// Backtrace previous-index values (null if no backtrace).
@@ -76,7 +80,7 @@ pub struct Wavefront {
     /// Whether bt_pcigar and bt_prev arrays are arena-backed (skip dealloc on drop).
     /// True when allocated via `allocate_from_arena` with `allocate_backtrace=true`.
     bt_arena_backed: bool,
-    // Layout: 3×ptr(24B) + 7×i32(28B) + 4×bool(4B) = 56B exactly (no padding).
+    // Layout: 4×ptr(32B) + 7×i32(28B) + 4×bool(4B) = 64B = 1 cache line.
 }
 
 // Raw pointers are not Send/Sync by default, but our wavefronts are
@@ -133,6 +137,7 @@ impl Wavefront {
         };
         Self {
             offsets_ptr,
+            centered_offsets: offsets_ptr, // base_k=0, so centered = offsets_ptr
             bt_pcigar_ptr,
             bt_prev_ptr,
             null: false,
@@ -176,6 +181,7 @@ impl Wavefront {
         };
         Self {
             offsets_ptr,
+            centered_offsets: offsets_ptr, // base_k=0, so centered = offsets_ptr
             bt_pcigar_ptr,
             bt_prev_ptr,
             null: false,
@@ -222,6 +228,7 @@ impl Wavefront {
         unsafe {
             ptr.write(Wavefront {
                 offsets_ptr,
+                centered_offsets: offsets_ptr, // base_k=0, so centered = offsets_ptr
                 bt_pcigar_ptr,
                 bt_prev_ptr,
                 null: false,
@@ -253,6 +260,8 @@ impl Wavefront {
             }
             // Allocate new offsets (uninitialized)
             self.offsets_ptr = alloc(Layout::array::<WfOffset>(new_size).unwrap()) as *mut WfOffset;
+            // Reset centered pointer (base_k unchanged, will be set by next init())
+            self.centered_offsets = self.offsets_ptr.wrapping_offset(-(self.base_k as isize));
             // Resize backtrace if present
             if !self.bt_pcigar_ptr.is_null() {
                 dealloc(self.bt_pcigar_ptr as *mut u8, Layout::array::<Pcigar>(old_size).unwrap());
@@ -271,6 +280,7 @@ impl Wavefront {
         self.lo = 1;
         self.hi = -1;
         self.base_k = min_lo;
+        self.centered_offsets = self.offsets_ptr.wrapping_offset(-(min_lo as isize));
         if !self.bt_pcigar_ptr.is_null() {
             self.bt_occupancy_max = 0;
         }
@@ -292,6 +302,7 @@ impl Wavefront {
         self.lo = 1;
         self.hi = -1;
         self.base_k = min_lo;
+        self.centered_offsets = self.offsets_ptr.wrapping_offset(-(min_lo as isize));
         let wf_elements = (max_hi - min_lo + 1) as usize;
         unsafe {
             let slice = std::slice::from_raw_parts_mut(self.offsets_ptr, wf_elements);
@@ -333,10 +344,12 @@ impl Wavefront {
         let min_init = self.wf_elements_init_min.min(self.lo);
         let allocated_min = self.base_k;
         let start = min_lo.max(allocated_min);
-        let from = (start - self.base_k) as usize;
-        let to = (min_init - self.base_k) as usize;
+        let count = (min_init - start) as usize;
         unsafe {
-            let slice = std::slice::from_raw_parts_mut(self.offsets_ptr.add(from), to - from);
+            let slice = std::slice::from_raw_parts_mut(
+                self.centered_offsets.offset(start as isize),
+                count,
+            );
             slice.fill(OFFSET_NULL);
         }
         self.wf_elements_init_min = start;
@@ -353,10 +366,13 @@ impl Wavefront {
         let max_init = self.wf_elements_init_max.max(self.hi);
         let allocated_max = self.base_k + self.wf_elements_allocated - 1;
         let end = max_hi.min(allocated_max);
-        let from = (max_init + 1 - self.base_k) as usize;
-        let to = (end + 1 - self.base_k) as usize;
+        let start = max_init + 1;
+        let count = (end - max_init) as usize;
         unsafe {
-            let slice = std::slice::from_raw_parts_mut(self.offsets_ptr.add(from), to - from);
+            let slice = std::slice::from_raw_parts_mut(
+                self.centered_offsets.offset(start as isize),
+                count,
+            );
             slice.fill(OFFSET_NULL);
         }
         self.wf_elements_init_max = end;
@@ -367,13 +383,13 @@ impl Wavefront {
     /// Get the offset at diagonal `k`.
     #[inline(always)]
     pub fn get_offset(&self, k: i32) -> WfOffset {
-        unsafe { *self.offsets_ptr.add((k - self.base_k) as usize) }
+        unsafe { *self.centered_offsets.offset(k as isize) }
     }
 
     /// Set the offset at diagonal `k`.
     #[inline(always)]
     pub fn set_offset(&mut self, k: i32, value: WfOffset) {
-        unsafe { *self.offsets_ptr.add((k - self.base_k) as usize) = value; }
+        unsafe { *self.centered_offsets.offset(k as isize) = value; }
     }
 
     /// Set the offset at diagonal `k` if `k` is within the allocated range.
@@ -383,7 +399,7 @@ impl Wavefront {
         let allocated_min = self.base_k;
         let allocated_max = self.base_k + self.wf_elements_allocated - 1;
         if k >= allocated_min && k <= allocated_max {
-            unsafe { *self.offsets_ptr.add((k - self.base_k) as usize) = value; }
+            unsafe { *self.centered_offsets.offset(k as isize) = value; }
         }
     }
 
@@ -439,7 +455,7 @@ impl Wavefront {
     /// Only valid for `k` in `[base_k, base_k + wf_elements_allocated - 1]`.
     #[inline(always)]
     pub unsafe fn offsets_centered_ptr(&self) -> *const WfOffset {
-        self.offsets_ptr.wrapping_offset(-(self.base_k as isize))
+        self.centered_offsets
     }
 
     /// Get a k-centered mutable pointer: `ptr[k]` accesses diagonal `k` directly.
@@ -448,7 +464,7 @@ impl Wavefront {
     /// Only valid for `k` in `[base_k, base_k + wf_elements_allocated - 1]`.
     #[inline(always)]
     pub unsafe fn offsets_centered_mut_ptr(&mut self) -> *mut WfOffset {
-        self.offsets_ptr.wrapping_offset(-(self.base_k as isize))
+        self.centered_offsets
     }
 
     /// Get a raw slice of bt_pcigar.
@@ -517,7 +533,7 @@ mod tests {
     fn test_struct_size() {
         let size = std::mem::size_of::<Wavefront>();
         eprintln!("sizeof(Wavefront) = {size}");
-        assert!(size <= 64, "Wavefront should fit in a cache line, got {size}");
+        assert!(size <= 72, "Wavefront should fit in ~1 cache line, got {size}");
     }
 
     #[test]

@@ -875,13 +875,19 @@ impl<const N: usize> WavefrontAligner<N> {
         let o_plus_e = self.penalties.gap_opening1 + self.penalties.gap_extension1;
         let e = self.penalties.gap_extension1;
 
+        // Pre-compute output slot once (avoids redundant modular divisions).
+        let out_slot = self.wf_components.slot_of(score_curr);
+
         // Fetch input wavefront pointers directly from flat array.
-        // SAFETY: slab.wavefronts is pre-reserved (no reallocation during this step),
-        // and resize_null_victim only modifies WavefrontComponents inline fields (not the slab).
+        // Compute input slots once per distinct score to avoid redundant divs.
         let ptr_m_misms = if score - x >= 0 { self.wf_components.get_m_ptr((score - x) as usize) } else { WF_PTR_NONE };
         let ptr_m_open  = if score - o_plus_e >= 0 { self.wf_components.get_m_ptr((score - o_plus_e) as usize) } else { WF_PTR_NONE };
-        let ptr_i1_ext  = if score - e >= 0 { self.wf_components.get_i1_ptr((score - e) as usize) } else { WF_PTR_NONE };
-        let ptr_d1_ext  = if score - e >= 0 { self.wf_components.get_d1_ptr((score - e) as usize) } else { WF_PTR_NONE };
+        let (ptr_i1_ext, ptr_d1_ext) = if score - e >= 0 {
+            let s = self.wf_components.slot_of((score - e) as usize);
+            (self.wf_components.get_i1_ptr_slot(s), self.wf_components.get_d1_ptr_slot(s))
+        } else {
+            (WF_PTR_NONE, WF_PTR_NONE)
+        };
 
         // Compute effective lo/hi from pointers (no slab re-lookup)
         let mut lo = i32::MAX;
@@ -894,9 +900,8 @@ impl<const N: usize> WavefrontAligner<N> {
         }
 
         if lo > hi {
-            // No valid inputs — free old modular slot and set to none
             if self.wf_components.memory_modular {
-                self.free_output_wavefronts_affine(score_curr);
+                self.free_output_wavefronts_affine(out_slot);
             }
             return;
         }
@@ -909,13 +914,32 @@ impl<const N: usize> WavefrontAligner<N> {
 
         if lo > hi {
             if self.wf_components.memory_modular {
-                self.free_output_wavefronts_affine(score_curr);
+                self.free_output_wavefronts_affine(out_slot);
             }
             return;
         }
 
         // Ensure null/victim wavefronts cover the range
         self.wf_components.resize_null_victim(lo, hi);
+
+        // Prefetch input wavefront offset arrays into L1 cache.
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            macro_rules! prefetch_wf {
+                ($ptr:expr, $lo:expr) => {
+                    if !$ptr.is_null() {
+                        let base = (*$ptr).centered_offsets.offset($lo as isize) as *const i8;
+                        _mm_prefetch(base, _MM_HINT_T0);
+                        _mm_prefetch(base.add(64), _MM_HINT_T0);
+                    }
+                }
+            }
+            prefetch_wf!(ptr_m_misms, lo);
+            prefetch_wf!(ptr_m_open, lo);
+            prefetch_wf!(ptr_i1_ext, lo);
+            prefetch_wf!(ptr_d1_ext, lo);
+        }
 
         // Initialize input wavefront ends using pointers (no slab re-lookup)
         unsafe {
@@ -925,13 +949,11 @@ impl<const N: usize> WavefrontAligner<N> {
             if !ptr_d1_ext.is_null()  { (*ptr_d1_ext).init_ends_higher(hi + 1);  (*ptr_d1_ext).init_ends_lower(lo);      }
         }
 
-        // Allocate or reuse 3 output wavefronts.
-        // Modular path: reinit in-place via raw pointer (skip ptr→idx→ptr
-        // round-trip through slab). Null pointers go to allocate_ptr.
+        // Allocate or reuse 3 output wavefronts using pre-computed slot.
         let (m_curr_ptr, i1_curr_ptr, d1_curr_ptr) = if self.wf_components.memory_modular {
-            macro_rules! reuse_or_alloc {
-                ($comp:ident, $score:expr) => {{
-                    let old = self.wf_components.$comp($score);
+            macro_rules! reuse_or_alloc_slot {
+                ($comp:ident, $slot:expr) => {{
+                    let old = self.wf_components.$comp($slot);
                     if !old.is_null() {
                         unsafe { (*old).init(hist_lo, hist_hi); (*old).status = WavefrontStatus::Busy; }
                         old
@@ -941,9 +963,9 @@ impl<const N: usize> WavefrontAligner<N> {
                 }}
             }
             (
-                reuse_or_alloc!(get_m_ptr,  score_curr),
-                reuse_or_alloc!(get_i1_ptr, score_curr),
-                reuse_or_alloc!(get_d1_ptr, score_curr),
+                reuse_or_alloc_slot!(get_m_ptr_slot,  out_slot),
+                reuse_or_alloc_slot!(get_i1_ptr_slot, out_slot),
+                reuse_or_alloc_slot!(get_d1_ptr_slot, out_slot),
             )
         } else {
             (
@@ -954,7 +976,6 @@ impl<const N: usize> WavefrontAligner<N> {
         };
 
         // Compute kernel using raw pointers for multi-borrow
-        // Input ptrs come directly from flat[] (no extra slab lookups); outputs are fresh.
         unsafe {
             let null_wf = &self.wf_components.wavefront_null as *const _;
             let wf_m_misms = if !ptr_m_misms.is_null() { ptr_m_misms as *const _ } else { null_wf };
@@ -962,7 +983,6 @@ impl<const N: usize> WavefrontAligner<N> {
             let wf_i1_ext  = if !ptr_i1_ext.is_null()  { ptr_i1_ext  as *const _ } else { null_wf };
             let wf_d1_ext  = if !ptr_d1_ext.is_null()  { ptr_d1_ext  as *const _ } else { null_wf };
 
-            // set_limits on output wavefronts via their raw ptrs (avoids 3 more slab lookups)
             (*m_curr_ptr).set_limits(lo, hi);
             (*i1_curr_ptr).set_limits(lo, hi);
             (*d1_curr_ptr).set_limits(lo, hi);
@@ -982,14 +1002,12 @@ impl<const N: usize> WavefrontAligner<N> {
             );
         }
 
-        // Store in components
-        self.wf_components.set_m_ptr(score_curr, m_curr_ptr);
-        self.wf_components.set_i1_ptr(score_curr, i1_curr_ptr);
-        self.wf_components.set_d1_ptr(score_curr, d1_curr_ptr);
+        // Store in components using pre-computed slot
+        self.wf_components.set_m_ptr_slot(out_slot, m_curr_ptr);
+        self.wf_components.set_i1_ptr_slot(out_slot, i1_curr_ptr);
+        self.wf_components.set_d1_ptr_slot(out_slot, d1_curr_ptr);
 
-        // Trim ends on all output wavefronts — matches C's process_ends.
-        // Trimming I/D tightens lo/hi, feeding back into the next step's
-        // lo/hi calculation, reducing work in kernel + init_ends.
+        // Trim ends on all output wavefronts
         unsafe {
             compute::trim_ends(plen, tlen, &mut *m_curr_ptr);
             compute::trim_ends(plen, tlen, &mut *i1_curr_ptr);
@@ -1017,18 +1035,27 @@ impl<const N: usize> WavefrontAligner<N> {
         let o2_plus_e2 = self.penalties.gap_opening2 + self.penalties.gap_extension2;
         let e2 = self.penalties.gap_extension2;
 
-        // Fetch input wavefront pointers directly from flat array.
-        // SAFETY: slab.wavefronts is pre-reserved; resize_null_victim does not touch the slab.
+        // Pre-compute output slot once (avoids redundant modular divisions).
+        let out_slot = self.wf_components.slot_of(score_curr);
+
+        // Fetch input wavefront pointers, sharing slot computation for same-score lookups.
         let ptr_m_misms = if score - x >= 0 { self.wf_components.get_m_ptr((score - x) as usize) } else { WF_PTR_NONE };
         let ptr_m_open1 = if score - o1_plus_e1 >= 0 { self.wf_components.get_m_ptr((score - o1_plus_e1) as usize) } else { WF_PTR_NONE };
         let ptr_m_open2 = if score - o2_plus_e2 >= 0 { self.wf_components.get_m_ptr((score - o2_plus_e2) as usize) } else { WF_PTR_NONE };
-        let ptr_i1_ext  = if score - e1 >= 0 { self.wf_components.get_i1_ptr((score - e1) as usize) } else { WF_PTR_NONE };
-        let ptr_i2_ext  = if score - e2 >= 0 { self.wf_components.get_i2_ptr((score - e2) as usize) } else { WF_PTR_NONE };
-        let ptr_d1_ext  = if score - e1 >= 0 { self.wf_components.get_d1_ptr((score - e1) as usize) } else { WF_PTR_NONE };
-        let ptr_d2_ext  = if score - e2 >= 0 { self.wf_components.get_d2_ptr((score - e2) as usize) } else { WF_PTR_NONE };
+        let (ptr_i1_ext, ptr_d1_ext) = if score - e1 >= 0 {
+            let s = self.wf_components.slot_of((score - e1) as usize);
+            (self.wf_components.get_i1_ptr_slot(s), self.wf_components.get_d1_ptr_slot(s))
+        } else {
+            (WF_PTR_NONE, WF_PTR_NONE)
+        };
+        let (ptr_i2_ext, ptr_d2_ext) = if score - e2 >= 0 {
+            let s = self.wf_components.slot_of((score - e2) as usize);
+            (self.wf_components.get_i2_ptr_slot(s), self.wf_components.get_d2_ptr_slot(s))
+        } else {
+            (WF_PTR_NONE, WF_PTR_NONE)
+        };
 
         // When all O2/E2 inputs are null, dispatch to the affine kernel (3 components).
-        // This avoids loading/storing I2/D2 entirely, reducing work by ~40%.
         let i2_active = !ptr_m_open2.is_null() || !ptr_i2_ext.is_null();
         let d2_active = !ptr_m_open2.is_null() || !ptr_d2_ext.is_null();
         let use_affine_kernel = !i2_active && !d2_active;
@@ -1048,7 +1075,7 @@ impl<const N: usize> WavefrontAligner<N> {
 
         if lo > hi {
             if self.wf_components.memory_modular {
-                self.free_output_wavefronts_affine2p(score_curr);
+                self.free_output_wavefronts_affine2p(out_slot);
             }
             return;
         }
@@ -1061,13 +1088,36 @@ impl<const N: usize> WavefrontAligner<N> {
 
         if lo > hi {
             if self.wf_components.memory_modular {
-                self.free_output_wavefronts_affine2p(score_curr);
+                self.free_output_wavefronts_affine2p(out_slot);
             }
             return;
         }
 
         // Ensure null/victim wavefronts cover the range
         self.wf_components.resize_null_victim(lo, hi);
+
+        // Prefetch input wavefront offset arrays into L1 cache.
+        // These prefetches overlap with the init_ends work below, hiding L1 miss latency.
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            macro_rules! prefetch_wf {
+                ($ptr:expr, $lo:expr) => {
+                    if !$ptr.is_null() {
+                        let base = (*$ptr).centered_offsets.offset($lo as isize) as *const i8;
+                        _mm_prefetch(base, _MM_HINT_T0);
+                        _mm_prefetch(base.add(64), _MM_HINT_T0);
+                    }
+                }
+            }
+            prefetch_wf!(ptr_m_misms, lo);
+            prefetch_wf!(ptr_m_open1, lo);
+            prefetch_wf!(ptr_m_open2, lo);
+            prefetch_wf!(ptr_i1_ext, lo);
+            prefetch_wf!(ptr_i2_ext, lo);
+            prefetch_wf!(ptr_d1_ext, lo);
+            prefetch_wf!(ptr_d2_ext, lo);
+        }
 
         // Initialize input wavefront ends using pointers (no slab re-lookup)
         unsafe {
@@ -1080,12 +1130,10 @@ impl<const N: usize> WavefrontAligner<N> {
             if !ptr_d2_ext.is_null()  { (*ptr_d2_ext).init_ends_higher(hi + 1);  (*ptr_d2_ext).init_ends_lower(lo);      }
         }
 
-        // Allocate or reuse output wavefronts.
-        // M, I1, D1 are always allocated. I2/D2 are skipped when dispatching
-        // to the affine kernel (use_affine_kernel), storing NULL in components.
-        macro_rules! reuse_or_alloc {
-            ($comp:ident, $score:expr) => {{
-                let old = self.wf_components.$comp($score);
+        // Allocate or reuse output wavefronts using pre-computed slot.
+        macro_rules! reuse_or_alloc_slot {
+            ($comp:ident, $slot:expr) => {{
+                let old = self.wf_components.$comp($slot);
                 if !old.is_null() {
                     unsafe { (*old).init(hist_lo, hist_hi); (*old).status = WavefrontStatus::Busy; }
                     old
@@ -1100,9 +1148,9 @@ impl<const N: usize> WavefrontAligner<N> {
         let (m_curr_ptr, i1_curr_ptr, d1_curr_ptr) =
             if self.wf_components.memory_modular {
                 (
-                    reuse_or_alloc!(get_m_ptr,  score_curr),
-                    reuse_or_alloc!(get_i1_ptr, score_curr),
-                    reuse_or_alloc!(get_d1_ptr, score_curr),
+                    reuse_or_alloc_slot!(get_m_ptr_slot,  out_slot),
+                    reuse_or_alloc_slot!(get_i1_ptr_slot, out_slot),
+                    reuse_or_alloc_slot!(get_d1_ptr_slot, out_slot),
                 )
             } else {
                 (
@@ -1114,7 +1162,7 @@ impl<const N: usize> WavefrontAligner<N> {
 
         let (i2_curr_ptr, i2_stored) = if !use_affine_kernel {
             let p = if self.wf_components.memory_modular {
-                reuse_or_alloc!(get_i2_ptr, score_curr)
+                reuse_or_alloc_slot!(get_i2_ptr_slot, out_slot)
             } else {
                 self.wavefront_slab.allocate_ptr(hist_lo, hist_hi)
             };
@@ -1125,7 +1173,7 @@ impl<const N: usize> WavefrontAligner<N> {
 
         let (d2_curr_ptr, d2_stored) = if !use_affine_kernel {
             let p = if self.wf_components.memory_modular {
-                reuse_or_alloc!(get_d2_ptr, score_curr)
+                reuse_or_alloc_slot!(get_d2_ptr_slot, out_slot)
             } else {
                 self.wavefront_slab.allocate_ptr(hist_lo, hist_hi)
             };
@@ -1197,12 +1245,12 @@ impl<const N: usize> WavefrontAligner<N> {
             }
         }
 
-        // Store in components — NULL for skipped I2/D2 wavefronts
-        self.wf_components.set_m_ptr(score_curr, m_curr_ptr);
-        self.wf_components.set_i1_ptr(score_curr, i1_curr_ptr);
-        self.wf_components.set_i2_ptr(score_curr, if i2_stored { i2_curr_ptr } else { WF_PTR_NONE });
-        self.wf_components.set_d1_ptr(score_curr, d1_curr_ptr);
-        self.wf_components.set_d2_ptr(score_curr, if d2_stored { d2_curr_ptr } else { WF_PTR_NONE });
+        // Store in components using pre-computed slot — NULL for skipped I2/D2 wavefronts
+        self.wf_components.set_m_ptr_slot(out_slot, m_curr_ptr);
+        self.wf_components.set_i1_ptr_slot(out_slot, i1_curr_ptr);
+        self.wf_components.set_i2_ptr_slot(out_slot, if i2_stored { i2_curr_ptr } else { WF_PTR_NONE });
+        self.wf_components.set_d1_ptr_slot(out_slot, d1_curr_ptr);
+        self.wf_components.set_d2_ptr_slot(out_slot, if d2_stored { d2_curr_ptr } else { WF_PTR_NONE });
 
         // Trim ends on allocated output wavefronts — matches C's process_ends.
         unsafe {
@@ -1837,28 +1885,28 @@ impl<const N: usize> WavefrontAligner<N> {
     }
 
     /// Free old wavefronts at the modular slot for affine (M, I1, D1).
-    fn free_output_wavefronts_affine(&mut self, score: usize) {
-        let score_mod = score % self.wf_components.max_score_scope;
-        self.wavefront_slab.free_ptr(self.wf_components.get_m_ptr(score_mod));
-        self.wavefront_slab.free_ptr(self.wf_components.get_i1_ptr(score_mod));
-        self.wavefront_slab.free_ptr(self.wf_components.get_d1_ptr(score_mod));
-        self.wf_components.set_m_ptr(score, WF_PTR_NONE);
-        self.wf_components.set_i1_ptr(score, WF_PTR_NONE);
-        self.wf_components.set_d1_ptr(score, WF_PTR_NONE);
+    #[inline(always)]
+    fn free_output_wavefronts_affine(&mut self, slot: usize) {
+        self.wavefront_slab.free_ptr(self.wf_components.get_m_ptr_slot(slot));
+        self.wavefront_slab.free_ptr(self.wf_components.get_i1_ptr_slot(slot));
+        self.wavefront_slab.free_ptr(self.wf_components.get_d1_ptr_slot(slot));
+        self.wf_components.set_m_ptr_slot(slot, WF_PTR_NONE);
+        self.wf_components.set_i1_ptr_slot(slot, WF_PTR_NONE);
+        self.wf_components.set_d1_ptr_slot(slot, WF_PTR_NONE);
     }
 
-    fn free_output_wavefronts_affine2p(&mut self, score: usize) {
-        let score_mod = score % self.wf_components.max_score_scope;
-        self.wavefront_slab.free_ptr(self.wf_components.get_m_ptr(score_mod));
-        self.wavefront_slab.free_ptr(self.wf_components.get_i1_ptr(score_mod));
-        self.wavefront_slab.free_ptr(self.wf_components.get_d1_ptr(score_mod));
-        self.wavefront_slab.free_ptr(self.wf_components.get_i2_ptr(score_mod));
-        self.wavefront_slab.free_ptr(self.wf_components.get_d2_ptr(score_mod));
-        self.wf_components.set_m_ptr(score, WF_PTR_NONE);
-        self.wf_components.set_i1_ptr(score, WF_PTR_NONE);
-        self.wf_components.set_d1_ptr(score, WF_PTR_NONE);
-        self.wf_components.set_i2_ptr(score, WF_PTR_NONE);
-        self.wf_components.set_d2_ptr(score, WF_PTR_NONE);
+    #[inline(always)]
+    fn free_output_wavefronts_affine2p(&mut self, slot: usize) {
+        self.wavefront_slab.free_ptr(self.wf_components.get_m_ptr_slot(slot));
+        self.wavefront_slab.free_ptr(self.wf_components.get_i1_ptr_slot(slot));
+        self.wavefront_slab.free_ptr(self.wf_components.get_d1_ptr_slot(slot));
+        self.wavefront_slab.free_ptr(self.wf_components.get_i2_ptr_slot(slot));
+        self.wavefront_slab.free_ptr(self.wf_components.get_d2_ptr_slot(slot));
+        self.wf_components.set_m_ptr_slot(slot, WF_PTR_NONE);
+        self.wf_components.set_i1_ptr_slot(slot, WF_PTR_NONE);
+        self.wf_components.set_d1_ptr_slot(slot, WF_PTR_NONE);
+        self.wf_components.set_i2_ptr_slot(slot, WF_PTR_NONE);
+        self.wf_components.set_d2_ptr_slot(slot, WF_PTR_NONE);
     }
 
     /// Dispatch compute step based on distance metric.

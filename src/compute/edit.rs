@@ -65,7 +65,7 @@ pub fn compute_edit_idm(
         #[cfg(target_arch = "x86_64")]
         {
             use std::arch::x86_64::*;
-            if count >= 8 && is_x86_feature_detected!("avx2") {
+            if count >= 8 && (cfg!(target_feature = "avx2") || is_x86_feature_detected!("avx2")) {
                 unsafe {
                     let v_one = _mm256_set1_epi32(1);
                     let v_eight = _mm256_set1_epi32(8);
@@ -177,7 +177,7 @@ pub fn compute_indel_idm(
         #[cfg(target_arch = "x86_64")]
         {
             use std::arch::x86_64::*;
-            if count >= 8 && is_x86_feature_detected!("avx2") {
+            if count >= 8 && (cfg!(target_feature = "avx2") || is_x86_feature_detected!("avx2")) {
                 unsafe {
                     let v_one = _mm256_set1_epi32(1);
                     let v_eight = _mm256_set1_epi32(8);
