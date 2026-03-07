@@ -14,7 +14,7 @@ use crate::sequences::{SequenceMode, WavefrontSequences};
 use crate::components::WF_PTR_NONE;
 use crate::slab::{SlabMode, WavefrontSlab};
 use crate::termination;
-use crate::wavefront::WavefrontPos;
+use crate::wavefront::{WavefrontPos, WavefrontStatus};
 
 /// Alignment computation scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -718,8 +718,13 @@ impl<const N: usize> WavefrontAligner<N> {
         let hist_lo = self.wf_components.historic_min_lo;
         let hist_hi = self.wf_components.historic_max_hi;
         let curr_ptr = if self.wf_components.memory_modular {
-            let old_ptr = self.wf_components.get_m_ptr(score_curr);
-            self.wavefront_slab.reuse_or_allocate_ptr(old_ptr, hist_lo, hist_hi)
+            let old = self.wf_components.get_m_ptr(score_curr);
+            if !old.is_null() {
+                unsafe { (*old).init(hist_lo, hist_hi); (*old).status = WavefrontStatus::Busy; }
+                old
+            } else {
+                self.wavefront_slab.allocate_ptr(hist_lo, hist_hi)
+            }
         } else {
             self.wavefront_slab.allocate_ptr(hist_lo, hist_hi)
         };
@@ -817,8 +822,13 @@ impl<const N: usize> WavefrontAligner<N> {
         let hist_lo = self.wf_components.historic_min_lo;
         let hist_hi = self.wf_components.historic_max_hi;
         let curr_ptr = if self.wf_components.memory_modular {
-            let old_ptr = self.wf_components.get_m_ptr(score_curr);
-            self.wavefront_slab.reuse_or_allocate_ptr(old_ptr, hist_lo, hist_hi)
+            let old = self.wf_components.get_m_ptr(score_curr);
+            if !old.is_null() {
+                unsafe { (*old).init(hist_lo, hist_hi); (*old).status = WavefrontStatus::Busy; }
+                old
+            } else {
+                self.wavefront_slab.allocate_ptr(hist_lo, hist_hi)
+            }
         } else {
             self.wavefront_slab.allocate_ptr(hist_lo, hist_hi)
         };
@@ -915,15 +925,25 @@ impl<const N: usize> WavefrontAligner<N> {
             if !ptr_d1_ext.is_null()  { (*ptr_d1_ext).init_ends_higher(hi + 1);  (*ptr_d1_ext).init_ends_lower(lo);      }
         }
 
-        // Allocate or reuse 3 output wavefronts
+        // Allocate or reuse 3 output wavefronts.
+        // Modular path: reinit in-place via raw pointer (skip ptr→idx→ptr
+        // round-trip through slab). Null pointers go to allocate_ptr.
         let (m_curr_ptr, i1_curr_ptr, d1_curr_ptr) = if self.wf_components.memory_modular {
-            let old_m  = self.wf_components.get_m_ptr(score_curr);
-            let old_i1 = self.wf_components.get_i1_ptr(score_curr);
-            let old_d1 = self.wf_components.get_d1_ptr(score_curr);
+            macro_rules! reuse_or_alloc {
+                ($comp:ident, $score:expr) => {{
+                    let old = self.wf_components.$comp($score);
+                    if !old.is_null() {
+                        unsafe { (*old).init(hist_lo, hist_hi); (*old).status = WavefrontStatus::Busy; }
+                        old
+                    } else {
+                        self.wavefront_slab.allocate_ptr(hist_lo, hist_hi)
+                    }
+                }}
+            }
             (
-                self.wavefront_slab.reuse_or_allocate_ptr(old_m,  hist_lo, hist_hi),
-                self.wavefront_slab.reuse_or_allocate_ptr(old_i1, hist_lo, hist_hi),
-                self.wavefront_slab.reuse_or_allocate_ptr(old_d1, hist_lo, hist_hi),
+                reuse_or_alloc!(get_m_ptr,  score_curr),
+                reuse_or_alloc!(get_i1_ptr, score_curr),
+                reuse_or_alloc!(get_d1_ptr, score_curr),
             )
         } else {
             (
@@ -967,14 +987,14 @@ impl<const N: usize> WavefrontAligner<N> {
         self.wf_components.set_i1_ptr(score_curr, i1_curr_ptr);
         self.wf_components.set_d1_ptr(score_curr, d1_curr_ptr);
 
-        // Trim ends on M wavefront to detect null steps.
-        // I1/D1 don't need trimming: the NEON/scalar kernel already clamps
-        // out-of-bounds M offsets to OFFSET_NULL. I1/D1 values are only read
-        // at k±1 (within allocated range) and never used for termination.
-        {
-            let wf_curr = unsafe { &mut *m_curr_ptr };
-            compute::trim_ends(plen, tlen, wf_curr);
-            if wf_curr.null {
+        // Trim ends on all output wavefronts — matches C's process_ends.
+        // Trimming I/D tightens lo/hi, feeding back into the next step's
+        // lo/hi calculation, reducing work in kernel + init_ends.
+        unsafe {
+            compute::trim_ends(plen, tlen, &mut *m_curr_ptr);
+            compute::trim_ends(plen, tlen, &mut *i1_curr_ptr);
+            compute::trim_ends(plen, tlen, &mut *d1_curr_ptr);
+            if (*m_curr_ptr).null {
                 self.num_null_steps = i32::MAX;
             }
         }
@@ -1049,20 +1069,28 @@ impl<const N: usize> WavefrontAligner<N> {
             if !ptr_d2_ext.is_null()  { (*ptr_d2_ext).init_ends_higher(hi + 1);  (*ptr_d2_ext).init_ends_lower(lo);      }
         }
 
-        // Allocate or reuse 5 output wavefronts
+        // Allocate or reuse 5 output wavefronts.
+        // Modular path: reinit in-place via raw pointer (skip ptr→idx→ptr
+        // round-trip through slab). Null pointers go to allocate_ptr.
         let (m_curr_ptr, i1_curr_ptr, i2_curr_ptr, d1_curr_ptr, d2_curr_ptr) =
             if self.wf_components.memory_modular {
-                let old_m  = self.wf_components.get_m_ptr(score_curr);
-                let old_i1 = self.wf_components.get_i1_ptr(score_curr);
-                let old_i2 = self.wf_components.get_i2_ptr(score_curr);
-                let old_d1 = self.wf_components.get_d1_ptr(score_curr);
-                let old_d2 = self.wf_components.get_d2_ptr(score_curr);
+                macro_rules! reuse_or_alloc {
+                    ($comp:ident, $score:expr) => {{
+                        let old = self.wf_components.$comp($score);
+                        if !old.is_null() {
+                            unsafe { (*old).init(hist_lo, hist_hi); (*old).status = WavefrontStatus::Busy; }
+                            old
+                        } else {
+                            self.wavefront_slab.allocate_ptr(hist_lo, hist_hi)
+                        }
+                    }}
+                }
                 (
-                    self.wavefront_slab.reuse_or_allocate_ptr(old_m,  hist_lo, hist_hi),
-                    self.wavefront_slab.reuse_or_allocate_ptr(old_i1, hist_lo, hist_hi),
-                    self.wavefront_slab.reuse_or_allocate_ptr(old_i2, hist_lo, hist_hi),
-                    self.wavefront_slab.reuse_or_allocate_ptr(old_d1, hist_lo, hist_hi),
-                    self.wavefront_slab.reuse_or_allocate_ptr(old_d2, hist_lo, hist_hi),
+                    reuse_or_alloc!(get_m_ptr,  score_curr),
+                    reuse_or_alloc!(get_i1_ptr, score_curr),
+                    reuse_or_alloc!(get_i2_ptr, score_curr),
+                    reuse_or_alloc!(get_d1_ptr, score_curr),
+                    reuse_or_alloc!(get_d2_ptr, score_curr),
                 )
             } else {
                 (
@@ -1120,11 +1148,17 @@ impl<const N: usize> WavefrontAligner<N> {
         self.wf_components.set_d1_ptr(score_curr, d1_curr_ptr);
         self.wf_components.set_d2_ptr(score_curr, d2_curr_ptr);
 
-        // Trim ends on M wavefront only
-        {
-            let wf_curr = unsafe { &mut *m_curr_ptr };
-            compute::trim_ends(plen, tlen, wf_curr);
-            if wf_curr.null {
+        // Trim ends on all output wavefronts — matches C's process_ends.
+        // Trimming I/D wavefronts tightens their lo/hi, which feeds back into
+        // the next step's lo/hi calculation, reducing work in the kernel, init_ends,
+        // and allocation. Without this, the diagonal range grows monotonically.
+        unsafe {
+            compute::trim_ends(plen, tlen, &mut *m_curr_ptr);
+            compute::trim_ends(plen, tlen, &mut *i1_curr_ptr);
+            compute::trim_ends(plen, tlen, &mut *i2_curr_ptr);
+            compute::trim_ends(plen, tlen, &mut *d1_curr_ptr);
+            compute::trim_ends(plen, tlen, &mut *d2_curr_ptr);
+            if (*m_curr_ptr).null {
                 self.num_null_steps = i32::MAX;
             }
         }
