@@ -1007,11 +1007,11 @@ impl<const N: usize> WavefrontAligner<N> {
         self.wf_components.set_i1_ptr_slot(out_slot, i1_curr_ptr);
         self.wf_components.set_d1_ptr_slot(out_slot, d1_curr_ptr);
 
-        // Trim ends on all output wavefronts
+        // Trim ends on M wavefront only — matches C's process_ends.
+        // I/D wavefronts are not trimmed; the compute kernel's bounds check
+        // on M ensures only valid offsets reach the extend kernel.
         unsafe {
             compute::trim_ends(plen, tlen, &mut *m_curr_ptr);
-            compute::trim_ends(plen, tlen, &mut *i1_curr_ptr);
-            compute::trim_ends(plen, tlen, &mut *d1_curr_ptr);
             if (*m_curr_ptr).null {
                 self.num_null_steps = i32::MAX;
             }
@@ -1252,13 +1252,11 @@ impl<const N: usize> WavefrontAligner<N> {
         self.wf_components.set_d1_ptr_slot(out_slot, d1_curr_ptr);
         self.wf_components.set_d2_ptr_slot(out_slot, if d2_stored { d2_curr_ptr } else { WF_PTR_NONE });
 
-        // Trim ends on allocated output wavefronts — matches C's process_ends.
+        // Trim ends on M wavefront only — matches C's process_ends.
+        // I/D wavefronts are not trimmed; OOB values propagate through the
+        // recurrence but are removed when M is trimmed after each step.
         unsafe {
             compute::trim_ends(plen, tlen, &mut *m_curr_ptr);
-            compute::trim_ends(plen, tlen, &mut *i1_curr_ptr);
-            compute::trim_ends(plen, tlen, &mut *d1_curr_ptr);
-            if i2_stored { compute::trim_ends(plen, tlen, &mut *i2_curr_ptr); }
-            if d2_stored { compute::trim_ends(plen, tlen, &mut *d2_curr_ptr); }
             if (*m_curr_ptr).null {
                 self.num_null_steps = i32::MAX;
             }
