@@ -38,13 +38,13 @@ Benchmarked against the C reference implementation (WFA2-lib), 50,000 sequence p
 
 | Benchmark | Rust vs C | Notes |
 |---|---|---|
-| Edit distance (score) | **0.59x** | 1.7× faster |
-| Gap-linear (score) | **0.69x** | 1.4× faster |
-| Gap-affine (score) | **0.94x** | 1.06× faster |
-| Gap-affine (CIGAR) | **0.95x** | 1.06× faster |
-| Gap-affine 2-piece (score) | **1.00x** | Parity |
-| Gap-affine 2-piece (CIGAR) | 1.03x | |
-| BiWFA (ultralow memory) | **0.92x** | 1.09× faster |
+| Edit distance (score) | **0.56x** | 1.8× faster |
+| Gap-linear (score) | **0.68x** | 1.5× faster |
+| Gap-affine (score) | **0.85x** | 1.2× faster |
+| Gap-affine (CIGAR) | **0.90x** | 1.1× faster |
+| Gap-affine 2-piece (score) | **0.88x** | 1.1× faster |
+| Gap-affine 2-piece (CIGAR) | **0.86x** | 1.2× faster |
+| BiWFA (ultralow memory) | **0.86x** | 1.2× faster |
 
 Ratio < 1.0 means Rust is faster. Key optimizations include hand-written AVX2/NEON SIMD compute kernels (8 or 4 diagonals/iteration) with software prefetching, pre-centered wavefront offset pointers (matching C's `offsets = offsets_mem - min_lo` pattern), separate per-component wavefront arrays for optimal cache stride, arena bump allocation with cache coloring to eliminate L1 conflict misses, conditional kernel dispatch (affine fallback when O2/E2 inputs are null), wavefront reuse between alignments, and blockwise 64-bit sequence extension.
 
