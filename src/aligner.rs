@@ -117,7 +117,15 @@ impl<const N: usize> WavefrontAligner<N> {
         Self {
             sequences: WavefrontSequences::new(),
             wf_components,
-            wavefront_slab: WavefrontSlab::new(init_wf_length, false, SlabMode::Reuse),
+            wavefront_slab: {
+                let mut slab = WavefrontSlab::new(init_wf_length, false, SlabMode::Reuse);
+                // Enable cache coloring for 5-component (affine2p) aligners
+                // to reduce L1 cache set conflicts between the 12+ input arrays.
+                if N == 5 {
+                    slab.set_cache_coloring(24);
+                }
+                slab
+            },
             penalties,
             alignment_scope: AlignmentScope::ComputeScore,
             alignment_span: AlignmentSpan::End2End,
@@ -1007,14 +1015,19 @@ impl<const N: usize> WavefrontAligner<N> {
         self.wf_components.set_i1_ptr_slot(out_slot, i1_curr_ptr);
         self.wf_components.set_d1_ptr_slot(out_slot, d1_curr_ptr);
 
-        // Trim ends on M wavefront only — matches C's process_ends.
-        // I/D wavefronts are not trimmed; the compute kernel's bounds check
-        // on M ensures only valid offsets reach the extend kernel.
+        // Trim M wavefront, then clamp I/D lo/hi to M's trimmed range.
+        // This prevents untrimmed I/D wavefronts from widening the next step's range.
         unsafe {
             compute::trim_ends(plen, tlen, &mut *m_curr_ptr);
             if (*m_curr_ptr).null {
                 self.num_null_steps = i32::MAX;
             }
+            let m_lo = (*m_curr_ptr).lo;
+            let m_hi = (*m_curr_ptr).hi;
+            if (*i1_curr_ptr).lo < m_lo { (*i1_curr_ptr).lo = m_lo; }
+            if (*i1_curr_ptr).hi > m_hi { (*i1_curr_ptr).hi = m_hi; }
+            if (*d1_curr_ptr).lo < m_lo { (*d1_curr_ptr).lo = m_lo; }
+            if (*d1_curr_ptr).hi > m_hi { (*d1_curr_ptr).hi = m_hi; }
         }
     }
 
@@ -1252,13 +1265,27 @@ impl<const N: usize> WavefrontAligner<N> {
         self.wf_components.set_d1_ptr_slot(out_slot, d1_curr_ptr);
         self.wf_components.set_d2_ptr_slot(out_slot, if d2_stored { d2_curr_ptr } else { WF_PTR_NONE });
 
-        // Trim ends on M wavefront only — matches C's process_ends.
-        // I/D wavefronts are not trimmed; OOB values propagate through the
-        // recurrence but are removed when M is trimmed after each step.
+        // Trim M wavefront, then clamp I/D lo/hi to M's trimmed range.
+        // This prevents untrimmed I/D wavefronts from widening the next step's range
+        // without the cost of scanning each I/D wavefront's ends.
         unsafe {
             compute::trim_ends(plen, tlen, &mut *m_curr_ptr);
             if (*m_curr_ptr).null {
                 self.num_null_steps = i32::MAX;
+            }
+            let m_lo = (*m_curr_ptr).lo;
+            let m_hi = (*m_curr_ptr).hi;
+            if (*i1_curr_ptr).lo < m_lo { (*i1_curr_ptr).lo = m_lo; }
+            if (*i1_curr_ptr).hi > m_hi { (*i1_curr_ptr).hi = m_hi; }
+            if (*d1_curr_ptr).lo < m_lo { (*d1_curr_ptr).lo = m_lo; }
+            if (*d1_curr_ptr).hi > m_hi { (*d1_curr_ptr).hi = m_hi; }
+            if i2_stored {
+                if (*i2_curr_ptr).lo < m_lo { (*i2_curr_ptr).lo = m_lo; }
+                if (*i2_curr_ptr).hi > m_hi { (*i2_curr_ptr).hi = m_hi; }
+            }
+            if d2_stored {
+                if (*d2_curr_ptr).lo < m_lo { (*d2_curr_ptr).lo = m_lo; }
+                if (*d2_curr_ptr).hi > m_hi { (*d2_curr_ptr).hi = m_hi; }
             }
         }
     }

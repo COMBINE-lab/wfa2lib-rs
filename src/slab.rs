@@ -82,6 +82,11 @@ impl WavefrontSlab {
         self.wavefronts.reserve(num_wavefronts);
     }
 
+    /// Enable cache coloring on the arena.
+    pub fn set_cache_coloring(&mut self, n_colors: u32) {
+        self.arena.set_cache_coloring(n_colors);
+    }
+
     /// Get the slab mode.
     pub fn mode(&self) -> SlabMode {
         self.slab_mode

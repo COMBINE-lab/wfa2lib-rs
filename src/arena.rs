@@ -23,6 +23,12 @@ pub struct ByteArena {
     cursor: usize,
     /// Default size in bytes for new chunks.
     default_chunk_size: usize,
+    /// Cache coloring: number of colors to cycle through (0 = disabled).
+    /// Each allocation gets `color_counter * 64` extra bytes of padding,
+    /// shifting consecutive arrays into different L1 cache sets.
+    color_count: u32,
+    /// Current color index (cycles 0..color_count-1).
+    color_idx: u32,
 }
 
 // Raw pointer storage: ByteArena is single-owner and never shared.
@@ -38,6 +44,8 @@ impl ByteArena {
             current_chunk: 0,
             cursor: 0,
             default_chunk_size: cap,
+            color_count: 0,
+            color_idx: 0,
         };
         arena.add_chunk(cap);
         arena
@@ -55,14 +63,26 @@ impl ByteArena {
     pub fn alloc_bytes(&mut self, size: usize) -> *mut u8 {
         // Round size up to 8-byte boundary for alignment of next alloc.
         let size_aligned = (size + 7) & !7;
+        // Cache coloring: add padding to shift into different L1 cache sets.
+        let color_pad = if self.color_count > 0 {
+            let pad = self.color_idx as usize * 64;
+            self.color_idx += 1;
+            if self.color_idx >= self.color_count {
+                self.color_idx = 0;
+            }
+            pad
+        } else {
+            0
+        };
+        let total = size_aligned + color_pad;
         let (chunk_ptr, chunk_cap) = self.chunks[self.current_chunk];
-        let new_cursor = self.cursor + size_aligned;
+        let new_cursor = self.cursor + total;
         if new_cursor <= chunk_cap {
             let ptr = unsafe { chunk_ptr.add(self.cursor) };
             self.cursor = new_cursor;
             return ptr;
         }
-        self.alloc_slow(size_aligned)
+        self.alloc_slow(total)
     }
 
     /// Slow path: current chunk is full, try next or allocate a new one.
@@ -84,11 +104,21 @@ impl ByteArena {
         self.chunks[self.current_chunk].0
     }
 
+    /// Enable cache coloring with the given number of colors.
+    /// Each consecutive allocation gets `color * 64` extra bytes of padding,
+    /// cycling through 0..n-1 to shift arrays into different L1 cache sets.
+    /// Set to 0 to disable.
+    pub fn set_cache_coloring(&mut self, n_colors: u32) {
+        self.color_count = n_colors;
+        self.color_idx = 0;
+    }
+
     /// Reset the arena for a new alignment. Existing chunks are reused.
     #[inline]
     pub fn reset(&mut self) {
         self.current_chunk = 0;
         self.cursor = 0;
+        self.color_idx = 0;
     }
 
     /// Current memory used in bytes (approximate).
