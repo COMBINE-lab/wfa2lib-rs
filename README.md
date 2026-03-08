@@ -28,10 +28,10 @@ Benchmarked against the C reference implementation (WFA2-lib), 50,000 sequence p
 |---|---|---|---|
 | Edit distance (score) | 405 ms | 446 ms | **0.91x** |
 | Gap-linear (score) | 682 ms | 1090 ms | **0.63x** |
-| Gap-affine (score) | 3833 ms | 3670 ms | 1.04x |
-| Gap-affine (CIGAR) | 5106 ms | 5100 ms | **1.00x** |
-| Gap-affine 2-piece (score) | 20694 ms | 18570 ms | 1.11x |
-| Gap-affine 2-piece (CIGAR) | 23221 ms | 21270 ms | 1.09x |
+| Gap-affine (score) | 3980 ms | 3970 ms | **1.00x** |
+| Gap-affine (CIGAR) | 5440 ms | 5380 ms | 1.01x |
+| Gap-affine 2-piece (score) | 16800 ms | 19710 ms | **0.85x** |
+| Gap-affine 2-piece (CIGAR) | 20620 ms | 22070 ms | **0.93x** |
 | BiWFA (ultralow memory) | 7133 ms | 6660 ms | 1.07x |
 
 ### aarch64 (Apple M-series, NEON)
@@ -46,7 +46,7 @@ Benchmarked against the C reference implementation (WFA2-lib), 50,000 sequence p
 | Gap-affine 2-piece (CIGAR) | 1.03x | |
 | BiWFA (ultralow memory) | **0.92x** | 1.09× faster |
 
-Ratio < 1.0 means Rust is faster. Key optimizations include hand-written AVX2/NEON SIMD compute kernels (8 or 4 diagonals/iteration) with software prefetching, pre-centered wavefront offset pointers (matching C's `offsets = offsets_mem - min_lo` pattern), separate per-component wavefront arrays for optimal cache stride, arena bump allocation matching C's `mm_allocator` pattern, conditional kernel dispatch (affine fallback when O2/E2 inputs are null), wavefront reuse between alignments, and blockwise 64-bit sequence extension.
+Ratio < 1.0 means Rust is faster. Key optimizations include hand-written AVX2/NEON SIMD compute kernels (8 or 4 diagonals/iteration) with software prefetching, pre-centered wavefront offset pointers (matching C's `offsets = offsets_mem - min_lo` pattern), separate per-component wavefront arrays for optimal cache stride, arena bump allocation with cache coloring to eliminate L1 conflict misses, conditional kernel dispatch (affine fallback when O2/E2 inputs are null), wavefront reuse between alignments, and blockwise 64-bit sequence extension.
 
 ## Building
 
