@@ -287,7 +287,7 @@ impl Wavefront {
         self.wf_elements_init_min = 0;
         self.wf_elements_init_max = 0;
         debug_assert!(
-            max_hi <= min_lo + self.wf_elements_allocated - 1,
+            max_hi < min_lo + self.wf_elements_allocated,
             "max_hi={} exceeds allocated_max={} (base_k={}, alloc={})",
             max_hi,
             min_lo + self.wf_elements_allocated - 1,

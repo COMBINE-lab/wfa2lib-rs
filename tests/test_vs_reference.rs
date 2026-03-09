@@ -11,7 +11,7 @@ fn parse_sequences(path: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
     let content = fs::read_to_string(path).expect("failed to read sequence file");
     let lines: Vec<&str> = content.lines().collect();
     assert!(
-        lines.len() % 2 == 0,
+        lines.len().is_multiple_of(2),
         "sequence file must have even number of lines"
     );
 

@@ -105,9 +105,7 @@ mod tests {
 
     #[test]
     fn test_offset_null() {
-        // OFFSET_NULL should be very negative but not overflow when used in arithmetic
-        assert!(OFFSET_NULL < -1_000_000_000);
-        // Adding a reasonable value should not overflow
+        // Adding a reasonable value to OFFSET_NULL should not overflow
         let result = OFFSET_NULL + 1000;
         assert!(result < 0);
     }

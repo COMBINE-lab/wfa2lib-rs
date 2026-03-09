@@ -18,21 +18,23 @@ unsafe fn extend_scalar_one(
     k: i32,
     mut offset: WfOffset,
 ) -> WfOffset {
-    let v = (offset - k) as usize;
-    let h = offset as usize;
-    let mut p_ptr = pattern_base.add(v);
-    let mut t_ptr = text_base.add(h);
-    let mut cmp = (p_ptr as *const u64).read_unaligned()
-        ^ (t_ptr as *const u64).read_unaligned();
-    while cmp == 0 {
-        offset += 8;
-        p_ptr = p_ptr.add(8);
-        t_ptr = t_ptr.add(8);
-        cmp = (p_ptr as *const u64).read_unaligned()
+    unsafe {
+        let v = (offset - k) as usize;
+        let h = offset as usize;
+        let mut p_ptr = pattern_base.add(v);
+        let mut t_ptr = text_base.add(h);
+        let mut cmp = (p_ptr as *const u64).read_unaligned()
             ^ (t_ptr as *const u64).read_unaligned();
+        while cmp == 0 {
+            offset += 8;
+            p_ptr = p_ptr.add(8);
+            t_ptr = t_ptr.add(8);
+            cmp = (p_ptr as *const u64).read_unaligned()
+                ^ (t_ptr as *const u64).read_unaligned();
+        }
+        offset += (cmp.trailing_zeros() / 8) as i32;
+        offset
     }
-    offset += (cmp.trailing_zeros() / 8) as i32;
-    offset
 }
 
 /// Extend matches for end-to-end alignment using 64-bit blockwise comparison.

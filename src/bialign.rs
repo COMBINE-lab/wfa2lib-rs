@@ -139,8 +139,8 @@ pub fn breakpoint_m2m(
                     if vmaxvq_u32(v_mask) != 0 {
                         // Scalar scan within this batch to find first hit
                         let sums: [i32; 4] = std::mem::transmute(v_sum);
-                        for i in 0..4 {
-                            if sums[i] >= text_length {
+                        for (i, &sum_val) in sums.iter().enumerate() {
+                            if sum_val >= text_length {
                                 let k_hit = k_0 + i as i32;
                                 let k_1_hit = k_1_top - i as i32;
                                 let offset_0 = *ptr_0.offset(k_hit as isize);
