@@ -3,6 +3,9 @@ name = "wfa2lib-rs"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
+license = "BSD-3-Clause"
+description = "A from-scratch pure-Rust implementation of the Wavefront Alignment (WFA) algorithm"
+repository = "https://github.com/COMBINE-lab/wfa2lib-rs"
 
 [features]
 default = ["mimalloc-alloc"]
