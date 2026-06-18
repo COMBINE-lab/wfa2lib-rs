@@ -5,14 +5,21 @@ edition = "2024"
 rust-version = "1.91"
 
 [features]
-default = ["mimalloc-alloc"]
-mimalloc-alloc = ["mimalloc"]
+# `cli` pulls in everything the `align_benchmark` binary needs (argument
+# parsing + logging). It is in `default` so `cargo build`/`cargo run` keep
+# producing the benchmark binary as before. Library consumers should depend
+# with `default-features = false` to avoid the CLI/logging dependency tree.
+default = ["cli", "mimalloc-alloc"]
+cli = ["dep:clap", "dep:tracing", "dep:tracing-subscriber"]
+mimalloc-alloc = ["dep:mimalloc"]
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+# All four are binary-only (used solely under src/bin/), so they are optional
+# and enabled via features rather than imposed on library consumers.
+clap = { version = "4", features = ["derive"], optional = true }
 mimalloc = { version = "0.1", optional = true }
-tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", optional = true }
 
 [profile.release]
 lto = true
@@ -22,3 +29,6 @@ panic = "abort"
 [[bin]]
 name = "align_benchmark"
 path = "src/bin/align_benchmark.rs"
+# The binary needs the CLI dependency stack; skip it for library-only builds
+# (e.g. `--no-default-features`).
+required-features = ["cli"]
