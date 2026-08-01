@@ -152,6 +152,15 @@ impl<const N: usize> WavefrontAligner<N> {
         self.max_alignment_steps = max_steps;
     }
 
+    /// Set the alignment scope.
+    ///
+    /// [`AlignmentScope::ComputeScore`] (the default) computes only the
+    /// alignment score; [`AlignmentScope::ComputeAlignment`] additionally
+    /// produces the full CIGAR (retrievable via [`Self::cigar`]).
+    pub fn set_alignment_scope(&mut self, scope: AlignmentScope) {
+        self.alignment_scope = scope;
+    }
+
     /// Configure ends-free alignment with the given free-gap parameters.
     pub fn set_alignment_free_ends(
         &mut self,
