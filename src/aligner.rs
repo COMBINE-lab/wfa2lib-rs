@@ -218,6 +218,12 @@ impl<const N: usize> WavefrontAligner<N> {
             // Next score
             score += 1;
 
+            // Stop before writing past the score-indexed component arrays
+            if !self.wf_components.has_slot(score as usize) {
+                self.status = AlignStatus::MaxStepsReached;
+                break;
+            }
+
             // Compute next wavefront based on distance metric
             self.compute_step(score);
 
@@ -318,6 +324,12 @@ impl<const N: usize> WavefrontAligner<N> {
 
             // Next score
             score += 1;
+
+            // Stop before writing past the score-indexed component arrays
+            if !self.wf_components.has_slot(score as usize) {
+                self.status = AlignStatus::MaxStepsReached;
+                break;
+            }
 
             // Compute next wavefront based on distance metric
             match self.penalties.distance_metric {
@@ -1745,6 +1757,10 @@ impl<const N: usize> WavefrontAligner<N> {
             }
 
             score += 1;
+            if !base.wf_components.has_slot(score as usize) {
+                base.status = AlignStatus::MaxStepsReached;
+                break;
+            }
             base.compute_step(score);
 
             // For non-M components, also check right after compute
@@ -2094,6 +2110,66 @@ mod tests {
         assert_eq!(aligner.status(), AlignStatus::MaxStepsReached);
         // Score should be 2 (the limit), not the actual edit distance 4
         assert!(score <= 4);
+    }
+
+    /// Pattern/text whose end diagonal (k = -30) lies outside a [-5, 5] band.
+    fn band_excludes_target() -> (Vec<u8>, Vec<u8>) {
+        let pattern = b"ACGTTGCAAGCT".repeat(10);
+        let text = pattern[..90].to_vec();
+        (pattern, text)
+    }
+
+    #[test]
+    fn test_banded_unreachable_does_not_overflow_components() {
+        // The band keeps the end diagonal out of reach, so the score grows past
+        // `num_wavefronts`; this previously wrote out of bounds.
+        let (pattern, text) = band_excludes_target();
+        let band = HeuristicStrategy::BandedStatic {
+            min_k: -5,
+            max_k: 5,
+        };
+
+        let mut edit = EditAligner::new(WavefrontPenalties::new_edit());
+        edit.alignment_scope = AlignmentScope::ComputeAlignment;
+        edit.set_heuristic(band.clone());
+        edit.align_end2end(&pattern, &text);
+        assert_ne!(edit.status(), AlignStatus::Completed);
+
+        let mut affine2p = Affine2pAligner::new(WavefrontPenalties::new_affine2p(
+            crate::penalties::Affine2pPenalties {
+                match_: 0,
+                mismatch: 4,
+                gap_opening1: 6,
+                gap_extension1: 2,
+                gap_opening2: 24,
+                gap_extension2: 1,
+            },
+        ));
+        affine2p.alignment_scope = AlignmentScope::ComputeAlignment;
+        affine2p.set_heuristic(band);
+        affine2p.align_end2end(&pattern, &text);
+        assert_ne!(affine2p.status(), AlignStatus::Completed);
+    }
+
+    #[test]
+    fn test_banded_linear_init_ends_empty_range() {
+        // Band cutoffs leave lo below the requested init range; the init_ends
+        // fill must then be a no-op rather than a wrapped slice length.
+        let (pattern, text) = band_excludes_target();
+        let mut linear = EditAligner::new(WavefrontPenalties::new_linear(
+            crate::penalties::LinearPenalties {
+                match_: 0,
+                mismatch: 4,
+                indel: 2,
+            },
+        ));
+        linear.alignment_scope = AlignmentScope::ComputeAlignment;
+        linear.set_heuristic(HeuristicStrategy::BandedStatic {
+            min_k: -5,
+            max_k: 5,
+        });
+        linear.align_end2end(&pattern, &text);
+        assert_ne!(linear.status(), AlignStatus::Completed);
     }
 
     // --- Gap-linear tests ---

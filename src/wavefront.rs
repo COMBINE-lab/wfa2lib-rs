@@ -344,13 +344,17 @@ impl Wavefront {
         let min_init = self.wf_elements_init_min.min(self.lo);
         let allocated_min = self.base_k;
         let start = min_lo.max(allocated_min);
-        let count = (min_init - start) as usize;
-        unsafe {
-            let slice = std::slice::from_raw_parts_mut(
-                self.centered_offsets.offset(start as isize),
-                count,
-            );
-            slice.fill(OFFSET_NULL);
+        // Empty when `lo` already lies below `min_lo` (e.g. after a band cutoff);
+        // C's `for (k=min_lo;k<min_init;++k)` is a no-op in that case.
+        if start < min_init {
+            let count = (min_init - start) as usize;
+            unsafe {
+                let slice = std::slice::from_raw_parts_mut(
+                    self.centered_offsets.offset(start as isize),
+                    count,
+                );
+                slice.fill(OFFSET_NULL);
+            }
         }
         self.wf_elements_init_min = start;
     }
@@ -367,13 +371,15 @@ impl Wavefront {
         let allocated_max = self.base_k + self.wf_elements_allocated - 1;
         let end = max_hi.min(allocated_max);
         let start = max_init + 1;
-        let count = (end - max_init) as usize;
-        unsafe {
-            let slice = std::slice::from_raw_parts_mut(
-                self.centered_offsets.offset(start as isize),
-                count,
-            );
-            slice.fill(OFFSET_NULL);
+        if end > max_init {
+            let count = (end - max_init) as usize;
+            unsafe {
+                let slice = std::slice::from_raw_parts_mut(
+                    self.centered_offsets.offset(start as isize),
+                    count,
+                );
+                slice.fill(OFFSET_NULL);
+            }
         }
         self.wf_elements_init_max = end;
     }
@@ -599,6 +605,36 @@ mod tests {
         assert_eq!(wf.hi, 3);
         assert_eq!(wf.wf_elements_init_min, -2);
         assert_eq!(wf.wf_elements_init_max, 3);
+    }
+
+    #[test]
+    fn test_init_ends_lower_empty_range() {
+        // lo < min_lo < wf_elements_init_min: nothing to fill (previously the
+        // negative count wrapped to a huge slice length).
+        let mut wf = Wavefront::allocate(21, false);
+        wf.init(-10, 10);
+        for k in -10..=10 {
+            wf.set_offset(k, 7);
+        }
+        wf.lo = -9;
+        wf.wf_elements_init_min = -5;
+        wf.init_ends_lower(-7);
+        assert_eq!(wf.wf_elements_init_min, -7);
+        assert!((-10..=10).all(|k| wf.get_offset(k) == 7));
+    }
+
+    #[test]
+    fn test_init_ends_higher_empty_range() {
+        let mut wf = Wavefront::allocate(21, false);
+        wf.init(-10, 10);
+        for k in -10..=10 {
+            wf.set_offset(k, 7);
+        }
+        wf.hi = 9;
+        wf.wf_elements_init_max = 5;
+        wf.init_ends_higher(7);
+        assert_eq!(wf.wf_elements_init_max, 7);
+        assert!((-10..=10).all(|k| wf.get_offset(k) == 7));
     }
 
     #[test]

@@ -233,6 +233,15 @@ impl<const N: usize> WavefrontComponents<N> {
         self.slot(score)
     }
 
+    /// Whether a wavefront slot exists for `score`. Always true in modular mode;
+    /// otherwise the score-indexed arrays hold `num_wavefronts` entries
+    /// (mirrors C's "Maximum allocated wavefronts reached" check in
+    /// `wavefront_compute_allocate_output`).
+    #[inline(always)]
+    pub fn has_slot(&self, score: usize) -> bool {
+        self.memory_modular || score < self.num_wavefronts
+    }
+
     /// Get the wavefront pointer for M-wavefronts at a given score.
     #[inline(always)]
     pub fn get_m_ptr(&self, score: usize) -> *mut Wavefront {
